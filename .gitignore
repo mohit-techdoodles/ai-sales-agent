@@ -1,0 +1,7 @@
+.env
+sales_agent.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
