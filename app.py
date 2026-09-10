@@ -14,22 +14,32 @@ Deployable free on Streamlit Community Cloud.
 """
 
 import os
+from datetime import datetime
 import streamlit as st
 from dotenv import load_dotenv
 
 from database import init_db
-from leads import receive_lead, list_leads, get_lead
+from leads import receive_lead, list_leads, get_lead, mark_opted_out
 from qualify import qualify_lead, submit_followup_answer
 from scoring import score_lead
-from draft import generate_draft, get_pending_messages_for_lead, list_all_messages
+from draft import generate_draft, get_pending_messages_for_lead, list_all_messages, get_lead_ids_with_pending_messages, generate_meeting_confirmation_draft
 from approval import approve_message, edit_and_approve_message, reject_message
 from research import research_lead, get_research
+from replies import check_for_replies, get_conversation
+from followup import get_leads_due_for_followup, generate_nudge_draft, FOLLOWUP_DUE_DAYS, MAX_NUDGES
+import opportunities as opp
+from calendar_booking import get_available_slots, book_meeting, get_meetings_for_lead, list_all_meetings
+from telegram_bot import get_telegram_link, check_for_telegram_updates
+from settings import get_setting, set_setting
 from analytics import (
     compute_funnel,
     compute_qualification_rate,
     compute_score_stats,
     compute_approval_rejection_rate,
     compute_followup_completion_rate,
+    compute_extended_funnel,
+    compute_response_rate,
+    compute_meeting_rate,
 )
 
 load_dotenv()
@@ -67,8 +77,8 @@ def staff_login_prompt(key_prefix: str):
             st.error("Incorrect password.")
 
 
-tab_new, tab_followup, tab_inbox, tab_dashboard = st.tabs(
-    ["📥 New Lead", "🗨️ Needs Info", "✅ Approval Inbox", "📊 Dashboard"]
+tab_new, tab_followup, tab_inbox, tab_conversations, tab_opportunities, tab_dashboard = st.tabs(
+    ["📥 New Lead", "🗨️ Needs Info", "✅ Approval Inbox", "💬 Conversations", "🎯 Opportunities", "📊 Dashboard"]
 )
 
 staff_ok = is_staff()  # computed once per run, used by the three internal tabs below
@@ -180,7 +190,8 @@ with tab_inbox:
     else:
         st.subheader("Pending drafts awaiting approval")
 
-        drafted_leads = list_leads(status="drafted")
+        pending_lead_ids = get_lead_ids_with_pending_messages()
+        drafted_leads = [get_lead(lid) for lid in pending_lead_ids if get_lead(lid) is not None]
 
         if not drafted_leads:
             st.info("No drafts pending approval right now.")
@@ -265,16 +276,275 @@ with tab_inbox:
                         except Exception as e:
                             st.error(f"Failed again: {e}")
 
+        # V2 Step 4: leads who were sent something but haven't replied in a while
+        due_leads = get_leads_due_for_followup()
+        if due_leads:
+            st.divider()
+            st.subheader("📅 Follow-ups due")
+            st.caption(f"No reply after {FOLLOWUP_DUE_DAYS} day(s) — generate a brief check-in (still goes through approval).")
+            for lead in due_leads:
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.write(
+                        f"{lead['name']} ({lead['company'] or 'no company'}) — "
+                        f"{lead['days_since_sent']} day(s) since last contact, "
+                        f"{lead.get('nudge_count', 0)}/{MAX_NUDGES} nudges used"
+                    )
+                with col2:
+                    if st.button("Draft nudge", key=f"nudge_{lead['id']}"):
+                        try:
+                            generate_nudge_draft(lead["id"])
+                            st.success("Nudge draft ready — see above.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Couldn't draft nudge: {e}")
 
-# ----------------------------- TAB 4: DASHBOARD (internal) -----------------------------
+
+# ----------------------------- TAB 4: CONVERSATIONS (internal) -----------------------------
+with tab_conversations:
+    if not staff_ok:
+        staff_login_prompt("conversations")
+    else:
+        st.subheader("Conversations")
+        st.caption(
+            "Reply checking is on-demand (polling), not instant — click the button below "
+            "to check the inbox for new replies since last time."
+        )
+
+        check_col1, check_col2 = st.columns(2)
+        with check_col1:
+            if st.button("🔄 Check for new email replies"):
+                try:
+                    with st.spinner("Checking inbox..."):
+                        summary = check_for_replies()
+                    st.success(
+                        f"Checked {summary['checked']} email(s) — "
+                        f"{summary['matched']} matched to leads "
+                        f"({summary['opted_out']} opted out), "
+                        f"{summary['unmatched']} from unknown senders, "
+                        f"{summary['duplicates_skipped']} already seen."
+                    )
+                except Exception as e:
+                    st.error(f"Couldn't check for replies: {e}")
+        with check_col2:
+            if st.button("🔄 Check Telegram"):
+                try:
+                    with st.spinner("Checking Telegram..."):
+                        tg_summary = check_for_telegram_updates()
+                    st.success(
+                        f"Checked {tg_summary['checked']} update(s) — "
+                        f"{tg_summary['linked']} new link(s), "
+                        f"{tg_summary['matched']} message(s) matched, "
+                        f"{tg_summary['unmatched']} unmatched."
+                    )
+                except Exception as e:
+                    st.error(f"Couldn't check Telegram: {e}")
+
+        st.divider()
+
+        # Show leads that have any conversation activity (replied, opted out, or previously sent to)
+        conversation_leads = [
+            l for l in list_leads()
+            if l["status"] in ("replied", "opted_out", "sent")
+        ]
+
+        if not conversation_leads:
+            st.info("No conversations yet.")
+
+        for lead in conversation_leads:
+            thread = get_conversation(lead["id"])
+            if not thread:
+                continue
+
+            status_badge = {"replied": "💬 Replied", "opted_out": "🚫 Opted out", "sent": "📤 Sent, no reply yet"}.get(lead["status"], lead["status"])
+
+            with st.expander(f"{lead['name']} — {lead['company'] or 'no company'} · {status_badge}"):
+                for msg in thread:
+                    channel_icon = "✈️" if msg.get("channel") == "telegram" else "📧"
+                    if msg["direction"] == "inbound":
+                        st.markdown(f"**← {lead['name']}** {channel_icon} _{msg['created_at'][:19]}_")
+                    else:
+                        st.markdown(f"**→ Us** {channel_icon} _{msg['created_at'][:19]}_")
+                    if msg.get("subject"):
+                        st.caption(f"Subject: {msg['subject']}")
+                    st.write(msg["body"])
+                    st.divider()
+
+                if lead["status"] == "replied":
+                    action_col1, action_col2, action_col3 = st.columns(3)
+                    with action_col1:
+                        if st.button("✍️ Generate reply draft", key=f"gen_reply_{lead['id']}"):
+                            try:
+                                with st.spinner("Drafting a reply based on the conversation..."):
+                                    generate_draft(lead["id"])
+                                st.success("Draft ready — check the Approval Inbox to review and send.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Couldn't generate a reply: {e}")
+                    with action_col2:
+                        if st.button("🚫 Mark do-not-contact", key=f"optout_{lead['id']}"):
+                            mark_opted_out(lead["id"], reason="Marked manually by staff")
+                            st.warning("Marked as do-not-contact. No further outreach will be sent.")
+                            st.rerun()
+                    with action_col3:
+                        if not lead.get("telegram_chat_id"):
+                            if st.button("✈️ Get Telegram link", key=f"tg_link_{lead['id']}"):
+                                try:
+                                    link = get_telegram_link(lead["id"])
+                                    st.info(f"Share this with the lead: {link}")
+                                except Exception as e:
+                                    st.error(f"Couldn't generate link: {e}")
+                        else:
+                            st.caption("✈️ Telegram linked")
+
+                    st.divider()
+                    st.markdown("**📅 Meetings**")
+
+                    existing_meetings = get_meetings_for_lead(lead["id"])
+                    for m in existing_meetings:
+                        status_icon = "✅" if m["status"] == "scheduled" else "❌"
+                        st.write(f"{status_icon} {m['start_at'][:16]} — {m['status']}")
+                        if m.get("meet_link"):
+                            st.caption(f"[Google Meet link]({m['meet_link']})")
+
+                    if st.button("Find available times", key=f"find_slots_{lead['id']}"):
+                        try:
+                            with st.spinner("Checking your calendar..."):
+                                st.session_state[f"slots_{lead['id']}"] = get_available_slots(days_ahead=5)
+                        except Exception as e:
+                            st.error(f"Couldn't fetch availability: {e}")
+
+                    slots_key = f"slots_{lead['id']}"
+                    if slots_key in st.session_state and st.session_state[slots_key]:
+                        slot_labels = {
+                            f"{datetime.fromisoformat(s['start']).strftime('%a %b %d, %I:%M %p')}": s
+                            for s in st.session_state[slots_key][:15]  # keep the list manageable
+                        }
+                        chosen_label = st.selectbox("Pick a time", list(slot_labels.keys()), key=f"slot_pick_{lead['id']}")
+                        if st.button("📅 Book this meeting", key=f"book_{lead['id']}"):
+                            chosen_slot = slot_labels[chosen_label]
+                            try:
+                                with st.spinner("Booking and sending calendar invite..."):
+                                    booking_result = book_meeting(lead["id"], chosen_slot["start"], chosen_slot["end"])
+                                try:
+                                    generate_meeting_confirmation_draft(
+                                        lead["id"], chosen_label, booking_result.get("meet_link", "")
+                                    )
+                                    st.success("Meeting booked, invite sent, and a confirmation message is ready in the Approval Inbox!")
+                                except Exception as draft_error:
+                                    st.success("Meeting booked and invite sent!")
+                                    st.warning(f"(Couldn't generate a confirmation draft: {draft_error})")
+                                del st.session_state[slots_key]
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Couldn't book meeting: {e}")
+
+                elif lead["status"] == "opted_out":
+                    st.warning("This lead has opted out. No further outreach will be sent to them.")
+                elif lead["status"] == "sent":
+                    if st.button("🚫 Mark do-not-contact", key=f"optout_{lead['id']}"):
+                        mark_opted_out(lead["id"], reason="Marked manually by staff")
+                        st.warning("Marked as do-not-contact. No further outreach will be sent.")
+                        st.rerun()
+
+
+# ----------------------------- TAB 5: OPPORTUNITIES (internal) -----------------------------
+with tab_opportunities:
+    if not staff_ok:
+        staff_login_prompt("opportunities")
+    else:
+        st.subheader("Pipeline")
+
+        all_opps = opp.list_opportunities()
+        pipeline = opp.pipeline_value_by_stage()
+
+        # --- Pipeline summary ---
+        summary_cols = st.columns(len(opp.STAGES))
+        for i, stage in enumerate(opp.STAGES):
+            with summary_cols[i]:
+                st.metric(stage.capitalize(), f"${pipeline['totals'][stage]:,.0f}", f"{pipeline['counts'][stage]} deal(s)")
+
+        st.divider()
+
+        # --- Existing opportunities: edit stage/value/probability/next action ---
+        if all_opps:
+            st.markdown("#### Active opportunities")
+            for o in all_opps:
+                with st.expander(f"{o['lead_name']} — {o['lead_company'] or 'no company'} · {o['stage']} · ${o['value'] or 0:,.0f}"):
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        new_stage = st.selectbox("Stage", opp.STAGES, index=opp.STAGES.index(o["stage"]), key=f"stage_{o['id']}")
+                    with col2:
+                        new_value = st.number_input("Value ($)", value=float(o["value"] or 0), step=100.0, key=f"value_{o['id']}")
+                    with col3:
+                        new_probability = st.slider("Probability (%)", 0, 100, o["probability"] or 0, key=f"prob_{o['id']}")
+
+                    new_next_action = st.text_input("Next action", value=o["next_action"] or "", key=f"next_{o['id']}")
+
+                    if st.button("Save changes", key=f"save_opp_{o['id']}"):
+                        opp.update_opportunity(o["id"], stage=new_stage, value=new_value, probability=new_probability, next_action=new_next_action)
+                        st.success("Updated.")
+                        st.rerun()
+        else:
+            st.info("No opportunities yet — create one below from an active lead.")
+
+        st.divider()
+
+        # --- Create a new opportunity from a lead that doesn't have one yet ---
+        st.markdown("#### Create opportunity from a lead")
+        leads_with_opps = {o["lead_id"] for o in all_opps}
+        eligible_leads = [
+            l for l in list_leads()
+            if l["id"] not in leads_with_opps and l["status"] not in ("rejected", "opted_out", "new")
+        ]
+
+        if not eligible_leads:
+            st.caption("No eligible leads right now (needs to be past initial qualification, and not already tracked).")
+        else:
+            lead_options = {f"{l['name']} — {l['company'] or 'no company'} (status: {l['status']})": l["id"] for l in eligible_leads}
+            selected_label = st.selectbox("Lead", list(lead_options.keys()))
+            selected_lead_id = lead_options[selected_label]
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                init_stage = st.selectbox("Initial stage", opp.STAGES, index=0, key="new_opp_stage")
+            with c2:
+                init_value = st.number_input("Estimated value ($)", min_value=0.0, step=100.0, key="new_opp_value")
+            with c3:
+                init_probability = st.slider("Probability (%)", 0, 100, 25, key="new_opp_prob")
+
+            init_next_action = st.text_input("Next action", key="new_opp_next")
+
+            if st.button("Create opportunity"):
+                opp.create_opportunity(selected_lead_id, stage=init_stage, value=init_value, probability=init_probability, next_action=init_next_action)
+                st.success("Opportunity created.")
+                st.rerun()
+
+
+# ----------------------------- TAB 6: DASHBOARD (internal) -----------------------------
 with tab_dashboard:
     if not staff_ok:
         staff_login_prompt("dashboard")
     else:
+        with st.expander("⚙️ Brand voice & messaging rules"):
+            st.caption("Applied automatically to every AI-drafted message across all channels.")
+            current_guidelines = get_setting("brand_guidelines", "")
+            new_guidelines = st.text_area(
+                "Guidelines",
+                value=current_guidelines,
+                height=100,
+                placeholder="e.g. Never mention competitor names. Always sign off as 'The Gaucha Team'. Keep a warm, casual tone.",
+            )
+            if st.button("Save guidelines"):
+                set_setting("brand_guidelines", new_guidelines)
+                st.success("Saved — applies to new drafts going forward.")
+
         st.subheader("Analytics")
 
         all_leads = list_leads()
         all_messages = list_all_messages()
+        all_meetings = list_all_meetings()
+        all_opportunities = opp.list_opportunities()
 
         if not all_leads:
             st.info("No leads yet.")
@@ -284,6 +554,9 @@ with tab_dashboard:
             score_stats = compute_score_stats(all_leads)
             approval_stats = compute_approval_rejection_rate(all_messages)
             followup_stats = compute_followup_completion_rate(all_leads)
+            extended_funnel = compute_extended_funnel(all_leads, all_messages, all_meetings, all_opportunities)
+            response_stats = compute_response_rate(all_messages)
+            meeting_stats = compute_meeting_rate(all_messages, all_meetings)
 
             # --- Top-line KPIs ---
             col1, col2, col3, col4 = st.columns(4)
@@ -294,8 +567,35 @@ with tab_dashboard:
 
             st.divider()
 
-            # --- Funnel ---
-            st.markdown("#### Funnel")
+            # --- V2: the exact blueprint funnel shape (Lead -> qualified -> contacted -> replied -> meeting -> opportunity) ---
+            st.markdown("#### Pipeline funnel (Lead → Qualified → Contacted → Replied → Meeting → Opportunity)")
+            st.bar_chart({
+                "Lead": extended_funnel["lead"],
+                "Qualified": extended_funnel["qualified"],
+                "Contacted": extended_funnel["contacted"],
+                "Replied": extended_funnel["replied"],
+                "Meeting": extended_funnel["meeting"],
+                "Opportunity": extended_funnel["opportunity"],
+            })
+
+            rate_col1, rate_col2 = st.columns(2)
+            with rate_col1:
+                st.metric(
+                    "Response rate",
+                    f"{response_stats['response_rate']}%" if response_stats["response_rate"] is not None else "—",
+                    help=f"Of {response_stats['contacted_count']} contacted lead(s), how many replied",
+                )
+            with rate_col2:
+                st.metric(
+                    "Meeting-booking rate",
+                    f"{meeting_stats['meeting_rate']}%" if meeting_stats["meeting_rate"] is not None else "—",
+                    help=f"Of {meeting_stats['contacted_count']} contacted lead(s), how many got a meeting booked",
+                )
+
+            st.divider()
+
+            # --- Status-snapshot funnel (current state, not lifetime events) ---
+            st.markdown("#### Current status breakdown")
             funnel_col1, funnel_col2 = st.columns([2, 1])
             with funnel_col1:
                 funnel_chart_data = {
@@ -342,12 +642,9 @@ with tab_dashboard:
 
             st.divider()
 
-            # --- Honest notes on what's not measurable yet ---
-            with st.expander("ℹ️ Metrics not yet available (require V2 features)"):
+            # --- Honest note on the one metric still genuinely blocked ---
+            with st.expander("ℹ️ Metric not yet available"):
                 st.markdown(
-                    "- **Response rate** — needs a channel that captures the lead's replies "
-                    "(V2's conversation memory / multi-channel engagement).\n"
-                    "- **Meeting-booking rate** — needs calendar integration (explicitly a V2 feature).\n"
                     "- **Cost per qualified opportunity** — currently $0 since Groq's free tier is in use; "
                     "meaningful once running on a paid model where per-call cost applies."
                 )

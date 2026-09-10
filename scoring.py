@@ -127,3 +127,38 @@ def score_lead(lead_id: int) -> dict:
     log_activity(lead_id, "scored", f"Score: {score}/100 — {reasons_text}")
 
     return {"score": score, "reasons": reasons}
+
+
+ENGAGEMENT_BONUS = 10  # a lead who replies at all is a meaningfully stronger signal
+
+
+def rescore_lead(lead_id: int) -> dict:
+    """
+    V2 Step 3 — recalculates the score after a reply (using whatever
+    requirements are freshest, e.g. after reextract_from_reply()), and adds
+    a flat engagement bonus for having replied at all — responsiveness is
+    itself a real qualifying signal a one-shot initial score can't capture.
+
+    Unlike score_lead(), this does NOT touch lead.status (keeps 'replied'/
+    'opted_out' intact — those are managed by the reply-handling flow).
+    Score is capped at 100. Returns {"score": int, "reasons": list[str]}.
+    """
+    requirements = get_requirements(lead_id)
+    if requirements is None:
+        raise ValueError(f"Lead {lead_id} has no extracted requirements yet.")
+
+    base_score, reasons = calculate_score(requirements)
+    final_score = min(100, base_score + ENGAGEMENT_BONUS)
+    reasons = reasons + [f"+{ENGAGEMENT_BONUS} replied to outreach (engagement signal)"]
+    reasons_text = "; ".join(reasons)
+    timestamp = now_iso()
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE leads SET score = ?, score_reasons = ?, updated_at = ? WHERE id = ?",
+            (final_score, reasons_text, timestamp, lead_id),
+        )
+
+    log_activity(lead_id, "rescored", f"Re-scored after reply: {final_score}/100 — {reasons_text}")
+
+    return {"score": final_score, "reasons": reasons}

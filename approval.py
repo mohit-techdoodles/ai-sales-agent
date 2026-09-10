@@ -21,16 +21,16 @@ from emailer import send_email
 
 
 def _dispatch_send(message: dict) -> dict:
-    """
-    Sends the message via the appropriate channel. Currently supports email
-    (via emailer.py). WhatsApp/other channels can be added here later
-    without touching the approval logic. Returns {"sent": bool, "error": str|None}.
-    """
     lead = get_lead(message["lead_id"])
-    to_email = lead.get("email", "") if lead else ""
 
     if message["channel"] == "email":
+        to_email = lead.get("email", "") if lead else ""
         return send_email(to_email, message.get("subject", ""), message["body"])
+
+    if message["channel"] == "telegram":
+        from telegram_bot import send_telegram_message
+        chat_id = lead.get("telegram_chat_id", "") if lead else ""
+        return send_telegram_message(chat_id, message["body"])
 
     print(f"\n--- SEND (channel '{message['channel']}' not yet implemented — printing instead) ---")
     print(f"Body:\n{message['body']}")
@@ -40,6 +40,13 @@ def _dispatch_send(message: dict) -> dict:
 
 def _finalize_send(message_id: int, lead_id: int, message: dict):
     """Attempts the actual send, then updates lead status based on the real outcome."""
+    lead = get_lead(lead_id)
+    if lead and lead.get("status") == "opted_out":
+        # Defense in depth: the lead may have opted out AFTER this draft was
+        # created but BEFORE it was approved. Never send to an opted-out lead.
+        log_activity(lead_id, "send_blocked", f"Message {message_id} blocked — lead has opted out")
+        raise RuntimeError("This lead has opted out since this draft was created. Sending blocked.")
+
     result = _dispatch_send(message)
     timestamp = now_iso()
 
@@ -141,7 +148,7 @@ def review_pending_lead(lead_id: int):
         print(f"No pending drafts for lead {lead_id}.")
         return
 
-    message = pending[0]
+    message = pending[0]  # most recent pending draft
 
     print("\n" + "=" * 60)
     print(f"PENDING DRAFT — Lead {lead_id} | Message {message['id']}")

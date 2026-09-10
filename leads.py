@@ -86,6 +86,23 @@ def receive_lead(name: str, email: str = "", phone: str = "", company: str = "",
     }
 
 
+def mark_opted_out(lead_id: int, reason: str = "") -> dict:
+    """
+    V2 Step 3 — manually mark a lead as opted out / do-not-contact.
+    For cases where the request came through a channel we don't monitor
+    automatically (e.g. a phone call), rather than a detected email reply.
+    Once set, draft.py and approval.py both hard-block any further outreach.
+    """
+    timestamp = now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE leads SET status = 'opted_out', updated_at = ? WHERE id = ?",
+            (timestamp, lead_id),
+        )
+    log_activity(lead_id, "opted_out", f"Manually marked do-not-contact by staff. Reason: {reason}")
+    return get_lead(lead_id)
+
+
 def get_lead(lead_id: int) -> dict | None:
     """Fetch a single lead by id."""
     with get_conn() as conn:

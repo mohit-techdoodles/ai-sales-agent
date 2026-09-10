@@ -41,9 +41,11 @@ def init_db():
                 company TEXT,
                 source TEXT,
                 message TEXT,                     -- the lead's original inquiry/message, for retry if AI steps fail
-                status TEXT DEFAULT 'new',       -- new | awaiting_info | qualifying | qualified | drafted | sent | send_failed | rejected
+                status TEXT DEFAULT 'new',       -- new | awaiting_info | qualifying | qualified | drafted | sent | send_failed | replied | opted_out | rejected
                 pending_question TEXT,            -- follow-up question waiting on the lead's reply, if any
                 followup_rounds INTEGER DEFAULT 0,  -- how many follow-up questions have been asked (capped)
+                nudge_count INTEGER DEFAULT 0,    -- how many "haven't heard back" follow-ups sent (capped, V2)
+                telegram_chat_id TEXT,             -- set once the lead starts our Telegram bot (V2)
                 score INTEGER,
                 score_reasons TEXT,               -- human-readable explanation of the score
                 created_at TEXT,
@@ -81,9 +83,11 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 lead_id INTEGER NOT NULL,
                 channel TEXT DEFAULT 'email',     -- email | whatsapp
+                direction TEXT DEFAULT 'outbound', -- outbound (our drafts) | inbound (lead's replies, V2)
                 subject TEXT,                      -- used for email; blank for whatsapp
                 body TEXT,
-                approval_status TEXT DEFAULT 'pending',  -- pending | approved | edited | rejected
+                approval_status TEXT DEFAULT 'pending',  -- pending | approved | edited | rejected | received (inbound)
+                external_id TEXT,                  -- email Message-ID, prevents re-importing the same reply twice
                 created_at TEXT,
                 decided_at TEXT,
                 FOREIGN KEY (lead_id) REFERENCES leads (id)
@@ -99,6 +103,41 @@ def init_db():
                 evidence_url TEXT,     -- where this came from, for verification
                 retrieved_at TEXT,     -- timestamp, so staleness is visible
                 FOREIGN KEY (lead_id) REFERENCES leads (id)
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS opportunities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER NOT NULL,
+                stage TEXT DEFAULT 'new',       -- new | qualified | proposal | negotiation | won | lost
+                value REAL,                      -- estimated deal value
+                probability INTEGER,             -- 0-100, win likelihood
+                next_action TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                FOREIGN KEY (lead_id) REFERENCES leads (id)
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS meetings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER NOT NULL,
+                calendar_event_id TEXT,
+                start_at TEXT,
+                end_at TEXT,
+                status TEXT DEFAULT 'scheduled',  -- scheduled | cancelled
+                meet_link TEXT,
+                created_at TEXT,
+                FOREIGN KEY (lead_id) REFERENCES leads (id)
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
             )
         """)
 

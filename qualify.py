@@ -41,7 +41,7 @@ FOLLOWUP_QUESTIONS = {
     "timeline": "What's your timeline for getting this in place?",
 }
 
-MAX_FOLLOWUP_ROUNDS = 1  # ask at most once, so we don't pester the lead
+MAX_FOLLOWUP_ROUNDS = 1  # ask at most three times, so we don't pester the lead
 
 SYSTEM_PROMPT = """You are a sales qualification assistant. Extract structured information \
 from what a lead has said about their needs.
@@ -221,11 +221,51 @@ def submit_followup_answer(lead_id: int, answer_text: str) -> dict:
     return qualify_lead(lead_id)
 
 
+def reextract_from_reply(lead_id: int) -> dict:
+    """
+    V2 Step 3 — re-runs requirement extraction after a reply comes in.
+
+    IMPORTANT: builds context from the ENTIRE conversation thread (original
+    message + every message since, both directions) — not just the latest
+    reply. Using only the newest reply would silently forget facts stated
+    in earlier turns (e.g. a timeline mentioned in reply #1 would vanish
+    from scoring the moment reply #2 arrived without repeating it).
+
+    Unlike qualify_lead(), this does NOT touch lead.status — that field is
+    used by the Conversations tab to track 'replied'/'opted_out', and we
+    don't want to reset it back to 'qualifying'. Saves a new
+    lead_requirements row (keeping history). Returns the updated requirements.
+    """
+    # Local import to avoid a circular import: replies.py imports this
+    # module at the top level, so this module must only reach back into
+    # replies.py lazily, at call time (by which point both are fully loaded).
+    from replies import get_conversation
+
+    lead = get_lead(lead_id)
+    if lead is None:
+        raise ValueError(f"Lead {lead_id} not found.")
+
+    thread = get_conversation(lead_id)
+    lines = [lead.get("message", "") or ""]
+    for msg in thread:
+        speaker = "Lead" if msg["direction"] == "inbound" else "Us"
+        lines.append(f"{speaker}: {msg['body']}")
+    combined_message = "\n\n".join(lines)
+
+    requirements = extract_requirements(combined_message)
+    timestamp = now_iso()
+    _save_requirements(lead_id, requirements, timestamp)
+
+    log_activity(lead_id, "reextracted_from_reply", f"Updated requirements from full thread: {requirements}")
+
+    return requirements
+
+
 def get_requirements(lead_id: int) -> dict | None:
     """Fetch the most recent extracted requirements for a lead."""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM lead_requirements WHERE lead_id = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM lead_requirements WHERE lead_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
             (lead_id,),
         ).fetchone()
         return dict(row) if row else None

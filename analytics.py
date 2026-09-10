@@ -107,3 +107,77 @@ def compute_followup_completion_rate(leads: list[dict]) -> dict:
         "still_waiting": len(asked) - len(completed),
         "completion_rate": round(100 * len(completed) / len(asked), 1),
     }
+
+
+def compute_extended_funnel(leads: list[dict], messages: list[dict], meetings: list[dict], opportunities: list[dict]) -> dict:
+    """
+    V2 — the exact funnel shape from the blueprint's North-Star KPI section:
+    Lead -> qualified -> contacted -> replied -> meeting -> opportunity.
+
+    Built from actual EVENTS that happened (has a score, has an approved
+    outbound message, has an inbound message, has a meeting row, has an
+    opportunity row) rather than the current lead.status snapshot — status
+    changes over time (e.g. sent -> replied), so counting live status would
+    undercount earlier funnel stages once a lead moves further along.
+    """
+    lead_ids = {l["id"] for l in leads}
+    qualified_ids = {l["id"] for l in leads if l.get("score") is not None}
+    contacted_ids = {
+        m["lead_id"] for m in messages
+        if m.get("direction") == "outbound" and m.get("approval_status") in ("approved", "edited")
+    }
+    replied_ids = {m["lead_id"] for m in messages if m.get("direction") == "inbound"}
+    meeting_ids = {m["lead_id"] for m in meetings}
+    opportunity_ids = {o["lead_id"] for o in opportunities}
+
+    return {
+        "lead": len(lead_ids),
+        "qualified": len(qualified_ids),
+        "contacted": len(contacted_ids),
+        "replied": len(replied_ids),
+        "meeting": len(meeting_ids),
+        "opportunity": len(opportunity_ids),
+    }
+
+
+def compute_response_rate(messages: list[dict]) -> dict:
+    """
+    Of leads actually contacted (an approved outbound message sent), what
+    fraction replied. Previously blocked on no reply-tracking existing —
+    unblocked now that email + Telegram reply detection exist.
+    """
+    contacted_ids = {
+        m["lead_id"] for m in messages
+        if m.get("direction") == "outbound" and m.get("approval_status") in ("approved", "edited")
+    }
+    replied_ids = {m["lead_id"] for m in messages if m.get("direction") == "inbound"}
+
+    if not contacted_ids:
+        return {"contacted_count": 0, "response_rate": None}
+
+    responded = contacted_ids & replied_ids
+    return {
+        "contacted_count": len(contacted_ids),
+        "response_rate": round(100 * len(responded) / len(contacted_ids), 1),
+    }
+
+
+def compute_meeting_rate(messages: list[dict], meetings: list[dict]) -> dict:
+    """
+    Of leads actually contacted, what fraction had a meeting booked.
+    Previously blocked on no calendar integration existing — unblocked now.
+    """
+    contacted_ids = {
+        m["lead_id"] for m in messages
+        if m.get("direction") == "outbound" and m.get("approval_status") in ("approved", "edited")
+    }
+    meeting_ids = {m["lead_id"] for m in meetings}
+
+    if not contacted_ids:
+        return {"contacted_count": 0, "meeting_rate": None}
+
+    booked = contacted_ids & meeting_ids
+    return {
+        "contacted_count": len(contacted_ids),
+        "meeting_rate": round(100 * len(booked) / len(contacted_ids), 1),
+    }
