@@ -18,6 +18,7 @@ Design: the actual Google API calls are kept in small, thin functions
 fully testable without hitting the real network.
 """
 
+import json
 import os
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
@@ -44,9 +45,27 @@ DEFAULT_MEETING_MINUTES = 30
 
 
 def _get_credentials() -> Credentials:
-    """Loads saved token.json, refreshing if needed, or runs one-time browser consent."""
+    """
+    Loads saved credentials, refreshing if needed.
+
+    Two sources, checked in order:
+    1. GOOGLE_TOKEN_JSON env var (a Streamlit Cloud secret) — the deployed
+       server has no browser to do interactive login, so we reuse the
+       token generated once locally. This works because a saved token
+       already bundles refresh_token + client_id + client_secret together,
+       so refreshing never needs the interactive flow again.
+    2. token.json file — for local development, where the interactive
+       browser flow (source #3 below) can actually run the first time.
+    3. If neither exists locally, falls back to running the interactive
+       browser consent flow using credentials.json (local dev only —
+       this will fail on a headless server, by design).
+    """
     creds = None
-    if os.path.exists(TOKEN_FILE):
+
+    token_json_env = os.environ.get("GOOGLE_TOKEN_JSON")
+    if token_json_env:
+        creds = Credentials.from_authorized_user_info(json.loads(token_json_env), SCOPES)
+    elif os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
 
     if not creds or not creds.valid:
@@ -61,8 +80,11 @@ def _get_credentials() -> Credentials:
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
 
-        with open(TOKEN_FILE, "w") as f:
-            f.write(creds.to_json())
+        # Only persist to the local file when we're NOT running from a
+        # server secret (no point overwriting a file that isn't being read).
+        if not token_json_env:
+            with open(TOKEN_FILE, "w") as f:
+                f.write(creds.to_json())
 
     return creds
 
