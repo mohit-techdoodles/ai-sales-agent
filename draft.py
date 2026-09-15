@@ -48,23 +48,31 @@ Do not include any text before or after the JSON object. Do not use markdown cod
 """
 
 FOLLOWUP_SYSTEM_PROMPT = """You are a sales development rep continuing an email conversation with a \
-lead who has already replied. You'll be given the full conversation thread so far (oldest first).
+lead who has already replied. You'll be given the full conversation thread so far (oldest first), \
+and possibly a list of APPROVED KNOWLEDGE (facts about pricing, features, policies you're allowed \
+to state confidently).
 
 Write a natural, direct reply to what they MOST RECENTLY said. Do NOT re-introduce yourself, do NOT \
 repeat the original pitch, and do NOT summarize the whole conversation back to them — just respond \
 like a human would to the latest message in an ongoing email thread.
 
-CRITICAL: You have NOT been given any information about pricing, features, setup time, capabilities, \
-or fit of our product/service. NEVER claim or imply that our offering matches their budget, timeline, \
-or requirements, and never invent facts. If they asked a specific question you can't verify the answer \
-to, acknowledge it honestly and offer to find out / connect them with someone who can confirm, rather \
-than guessing.
+CRITICAL — grounding rule:
+- You may confidently state anything that appears in the APPROVED KNOWLEDGE section.
+- For anything else about our product/pricing/features/capabilities NOT covered by approved \
+knowledge, do NOT guess or invent an answer. If their message raises a question or objection you \
+can't answer from approved knowledge, write a brief, honest holding reply (e.g. acknowledge the \
+question, say you'll confirm the details and follow up) AND set "needs_escalation": true so a human \
+can personally address it — do not fabricate a confident-sounding answer to something unverified.
 
 Tone: warm, professional, concise — like a real reply, not a template. Keep it under 100 words.
 
 Return ONLY a valid JSON object with exactly these keys:
 - "subject": the reply subject line, typically "Re: <original subject>" (string)
 - "body": the email body (string, plain text, no markdown)
+- "needs_escalation": true if their message raised something outside approved knowledge that a human \
+should personally handle, false otherwise (boolean)
+- "escalation_reason": if needs_escalation is true, a short note for staff on what needs answering \
+(string, "" if not needed)
 
 Do not include any text before or after the JSON object. Do not use markdown code fences.
 """
@@ -170,6 +178,14 @@ def _call_llm(system_prompt: str, context: str) -> str:
     if guidelines:
         system_prompt = system_prompt + f"\n\nCompany brand voice and messaging rules to follow:\n{guidelines}"
 
+    # V3: staff-configured approved knowledge base (pricing, features, objection
+    # responses) — only the FOLLOWUP prompt actually instructs on using it for
+    # objection handling, but injecting it generally means any mode can draw
+    # on it if relevant, without needing separate injection points per mode.
+    knowledge = get_setting("knowledge_base", "").strip()
+    if knowledge:
+        system_prompt = system_prompt + f"\n\nAPPROVED KNOWLEDGE (facts you may confidently state):\n{knowledge}"
+
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
     response = client.chat.completions.create(
         model=MODEL,
@@ -266,13 +282,16 @@ def generate_draft(lead_id: int, channel: str = None) -> dict:
         raise RuntimeError(f"Could not parse valid JSON draft from LLM after retry. Last response:\n{raw}")
 
     timestamp = now_iso()
+    needs_escalation = bool(parsed.get("needs_escalation", False))
+    escalation_reason = parsed.get("escalation_reason", "") or ""
+
     with get_conn() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO messages (lead_id, channel, direction, subject, body, approval_status, created_at)
-            VALUES (?, ?, 'outbound', ?, ?, 'pending', ?)
+            INSERT INTO messages (lead_id, channel, direction, subject, body, approval_status, needs_escalation, escalation_reason, created_at)
+            VALUES (?, ?, 'outbound', ?, ?, 'pending', ?, ?, ?)
             """,
-            (lead_id, channel, parsed.get("subject", ""), parsed.get("body", ""), timestamp),
+            (lead_id, channel, parsed.get("subject", ""), parsed.get("body", ""), int(needs_escalation), escalation_reason, timestamp),
         )
         message_id = cursor.lastrowid
 
@@ -287,7 +306,7 @@ def generate_draft(lead_id: int, channel: str = None) -> dict:
         f"Draft message_id={message_id} (mode={mode}) subject='{parsed.get('subject', '')}'",
     )
 
-    return {"message_id": message_id, "subject": parsed.get("subject", ""), "body": parsed.get("body", "")}
+    return {"message_id": message_id, "subject": parsed.get("subject", ""), "body": parsed.get("body", ""), "mode": mode, "needs_escalation": needs_escalation}
 
 
 def generate_meeting_confirmation_draft(lead_id: int, meeting_time_display: str, meet_link: str = "") -> dict:

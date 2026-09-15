@@ -24,12 +24,15 @@ from qualify import qualify_lead, submit_followup_answer
 from scoring import score_lead
 from draft import generate_draft, get_pending_messages_for_lead, list_all_messages, get_lead_ids_with_pending_messages, generate_meeting_confirmation_draft
 from approval import approve_message, edit_and_approve_message, reject_message
-from research import research_lead, get_research
+from research import research_lead, get_research, get_research_freshness
 from replies import check_for_replies, get_conversation
 from followup import get_leads_due_for_followup, generate_nudge_draft, FOLLOWUP_DUE_DAYS, MAX_NUDGES
 import opportunities as opp
 from calendar_booking import get_available_slots, book_meeting, get_meetings_for_lead, list_all_meetings
 from telegram_bot import get_telegram_link, check_for_telegram_updates
+from briefing import generate_briefing
+from policy import should_auto_approve, get_policy, set_policy, ACTION_TYPES
+from next_best_action import get_all_next_actions
 from settings import get_setting, set_setting
 from analytics import (
     compute_funnel,
@@ -77,11 +80,35 @@ def staff_login_prompt(key_prefix: str):
             st.error("Incorrect password.")
 
 
-tab_new, tab_followup, tab_inbox, tab_conversations, tab_opportunities, tab_dashboard = st.tabs(
-    ["📥 New Lead", "🗨️ Needs Info", "✅ Approval Inbox", "💬 Conversations", "🎯 Opportunities", "📊 Dashboard"]
+tab_new, tab_followup, tab_inbox, tab_conversations, tab_opportunities, tab_next_actions, tab_dashboard = st.tabs(
+    ["📥 New Lead", "🗨️ Needs Info", "✅ Approval Inbox", "💬 Conversations", "🎯 Opportunities", "🧭 Next Actions", "📊 Dashboard"]
 )
 
 staff_ok = is_staff()  # computed once per run, used by the three internal tabs below
+
+
+def maybe_auto_approve(message_id: int, lead_id: int, action_type: str, needs_escalation: bool = False) -> bool:
+    """
+    V3 — checks the autonomy policy and, if this action type is cleared for
+    auto-approval (and any value cap is satisfied), approves and sends the
+    draft immediately. Returns True if it was auto-approved, False if it's
+    waiting in the Approval Inbox as usual.
+
+    Hard safety override: a message flagged needs_escalation NEVER auto-sends,
+    no matter what the policy says — it involves a question outside approved
+    knowledge and genuinely needs a human's eyes.
+    """
+    if needs_escalation:
+        return False
+
+    if should_auto_approve(lead_id, action_type):
+        try:
+            approve_message(message_id)
+            return True
+        except Exception as e:
+            print(f"[policy] Auto-approval failed, leaving as pending for manual review: {e}")
+            return False
+    return False
 
 
 def run_ai_pipeline(lead_id: int):
@@ -107,9 +134,11 @@ def run_ai_pipeline(lead_id: int):
     with st.spinner("Scoring lead..."):
         score_result = score_lead(lead_id)
     with st.spinner("Drafting outreach message..."):
-        generate_draft(lead_id)
+        draft_result = generate_draft(lead_id)
 
-    return {"status": "qualified", "score": score_result["score"], "reasons": score_result["reasons"]}
+    auto_approved = maybe_auto_approve(draft_result["message_id"], lead_id, draft_result["mode"])
+
+    return {"status": "qualified", "score": score_result["score"], "reasons": score_result["reasons"], "auto_approved": auto_approved}
 
 
 # ----------------------------- TAB 1: NEW LEAD (public) -----------------------------
@@ -202,7 +231,11 @@ with tab_inbox:
                 continue
             message = pending[0]
 
-            with st.expander(f"{lead['name']} — {lead['company'] or 'no company'} (score: {lead['score']})", expanded=True):
+            escalation_marker = " 🚩 NEEDS REVIEW" if message.get("needs_escalation") else ""
+            with st.expander(f"{lead['name']} — {lead['company'] or 'no company'} (score: {lead['score']}){escalation_marker}", expanded=True):
+                if message.get("needs_escalation"):
+                    st.warning(f"⚠️ Outside approved knowledge — {message.get('escalation_reason') or 'please verify before sending'}")
+
                 col1, col2 = st.columns([2, 1])
 
                 with col1:
@@ -218,11 +251,22 @@ with tab_inbox:
                         st.caption(lead["score_reasons"])
 
                     findings = get_research(lead["id"])
+                    freshness = get_research_freshness(lead["id"])
                     if findings:
-                        st.markdown("**Research findings**")
+                        staleness_note = f" ⚠️ {freshness['days_old']} days old — consider refreshing" if freshness["is_stale"] else f" (updated {freshness['days_old']}d ago)"
+                        st.markdown(f"**Research findings**{staleness_note}")
                         for f in findings[:5]:  # keep it compact
                             st.caption(f"🔍 {f['finding']}")
                             st.caption(f"[source]({f['evidence_url']}) · {f['retrieved_at'][:10]}")
+                        if freshness["is_stale"]:
+                            if st.button("🔄 Refresh research", key=f"refresh_research_{lead['id']}"):
+                                try:
+                                    with st.spinner("Refreshing..."):
+                                        research_lead(lead["id"])
+                                    st.success("Refreshed.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Couldn't refresh: {e}")
 
                 btn_col1, btn_col2, btn_col3 = st.columns(3)
 
@@ -270,8 +314,11 @@ with tab_inbox:
                 with col2:
                     if st.button("Run AI pipeline", key=f"retry_{lead['id']}"):
                         try:
-                            run_ai_pipeline(lead["id"])
-                            st.success("Processed — check above for the new draft.")
+                            retry_result = run_ai_pipeline(lead["id"])
+                            if retry_result.get("auto_approved"):
+                                st.success("Processed and auto-approved/sent per autonomy settings.")
+                            else:
+                                st.success("Processed — check above for the new draft.")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Failed again: {e}")
@@ -293,8 +340,11 @@ with tab_inbox:
                 with col2:
                     if st.button("Draft nudge", key=f"nudge_{lead['id']}"):
                         try:
-                            generate_nudge_draft(lead["id"])
-                            st.success("Nudge draft ready — see above.")
+                            nudge_result = generate_nudge_draft(lead["id"])
+                            if maybe_auto_approve(nudge_result["message_id"], lead["id"], nudge_result["mode"]):
+                                st.success("Nudge auto-approved and sent per autonomy settings.")
+                            else:
+                                st.success("Nudge draft ready — see above.")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Couldn't draft nudge: {e}")
@@ -376,8 +426,13 @@ with tab_conversations:
                         if st.button("✍️ Generate reply draft", key=f"gen_reply_{lead['id']}"):
                             try:
                                 with st.spinner("Drafting a reply based on the conversation..."):
-                                    generate_draft(lead["id"])
-                                st.success("Draft ready — check the Approval Inbox to review and send.")
+                                    reply_result = generate_draft(lead["id"])
+                                if reply_result.get("needs_escalation"):
+                                    st.warning("⚠️ This reply involves something outside approved knowledge — please review carefully before sending.")
+                                elif maybe_auto_approve(reply_result["message_id"], lead["id"], reply_result["mode"], reply_result.get("needs_escalation", False)):
+                                    st.success("Reply auto-approved and sent per autonomy settings.")
+                                else:
+                                    st.success("Draft ready — check the Approval Inbox to review and send.")
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Couldn't generate a reply: {e}")
@@ -396,6 +451,20 @@ with tab_conversations:
                                     st.error(f"Couldn't generate link: {e}")
                         else:
                             st.caption("✈️ Telegram linked")
+
+                    st.divider()
+                    st.markdown("**📋 Sales briefing**")
+                    if st.button("Generate briefing", key=f"briefing_{lead['id']}"):
+                        try:
+                            with st.spinner("Compiling briefing..."):
+                                briefing_text = generate_briefing(lead["id"])
+                            st.session_state[f"briefing_text_{lead['id']}"] = briefing_text
+                        except Exception as e:
+                            st.error(f"Couldn't generate briefing: {e}")
+
+                    briefing_key = f"briefing_text_{lead['id']}"
+                    if briefing_key in st.session_state:
+                        st.text_area("Briefing", value=st.session_state[briefing_key], height=300, key=f"briefing_display_{lead['id']}")
 
                     st.divider()
                     st.markdown("**📅 Meetings**")
@@ -427,10 +496,13 @@ with tab_conversations:
                                 with st.spinner("Booking and sending calendar invite..."):
                                     booking_result = book_meeting(lead["id"], chosen_slot["start"], chosen_slot["end"])
                                 try:
-                                    generate_meeting_confirmation_draft(
+                                    conf_result = generate_meeting_confirmation_draft(
                                         lead["id"], chosen_label, booking_result.get("meet_link", "")
                                     )
-                                    st.success("Meeting booked, invite sent, and a confirmation message is ready in the Approval Inbox!")
+                                    if maybe_auto_approve(conf_result["message_id"], lead["id"], "meeting_confirmation"):
+                                        st.success("Meeting booked, invite sent, and confirmation auto-sent per autonomy settings!")
+                                    else:
+                                        st.success("Meeting booked, invite sent, and a confirmation message is ready in the Approval Inbox!")
                                 except Exception as draft_error:
                                     st.success("Meeting booked and invite sent!")
                                     st.warning(f"(Couldn't generate a confirmation draft: {draft_error})")
@@ -521,7 +593,77 @@ with tab_opportunities:
                 st.rerun()
 
 
-# ----------------------------- TAB 6: DASHBOARD (internal) -----------------------------
+# ----------------------------- TAB 6: NEXT ACTIONS (internal) -----------------------------
+with tab_next_actions:
+    if not staff_ok:
+        staff_login_prompt("next actions")
+    else:
+        st.subheader("What needs attention right now")
+        st.caption("Recommended next step per lead, based on their current state and conversation.")
+
+        actions = get_all_next_actions()
+
+        if not actions:
+            st.info("Nothing needs action right now — everything is either waiting on a lead or done.")
+
+        ACTION_ICONS = {
+            "run_pipeline": "⚙️",
+            "review_draft": "✅",
+            "escalate": "🚩",
+            "propose_meeting": "📅",
+            "generate_reply": "✍️",
+            "send_nudge": "👋",
+            "retry_send": "🔁",
+        }
+
+        for lead in actions:
+            action = lead["next_action"]
+            icon = ACTION_ICONS.get(action, "•")
+            with st.container():
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.write(f"{icon} **{lead['name']}** ({lead['company'] or 'no company'})")
+                    st.caption(lead["next_action_reason"])
+                with col2:
+                    if action == "run_pipeline":
+                        if st.button("Run pipeline", key=f"nba_run_{lead['id']}"):
+                            try:
+                                result = run_ai_pipeline(lead["id"])
+                                st.success("Done.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed: {e}")
+                    elif action == "generate_reply":
+                        if st.button("Generate reply", key=f"nba_reply_{lead['id']}"):
+                            try:
+                                reply_result = generate_draft(lead["id"])
+                                if not reply_result.get("needs_escalation"):
+                                    maybe_auto_approve(reply_result["message_id"], lead["id"], reply_result["mode"], reply_result.get("needs_escalation", False))
+                                st.success("Done — check Approval Inbox if not auto-sent.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed: {e}")
+                    elif action == "send_nudge":
+                        if st.button("Draft nudge", key=f"nba_nudge_{lead['id']}"):
+                            try:
+                                nudge_result = generate_nudge_draft(lead["id"])
+                                maybe_auto_approve(nudge_result["message_id"], lead["id"], nudge_result["mode"])
+                                st.success("Done — check Approval Inbox if not auto-sent.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed: {e}")
+                    elif action == "retry_send":
+                        st.caption("→ See 'Leads needing (re)processing' in Approval Inbox")
+                    elif action == "review_draft":
+                        st.caption("→ See Approval Inbox")
+                    elif action == "escalate":
+                        st.caption("→ See Approval Inbox (flagged 🚩)")
+                    elif action == "propose_meeting":
+                        st.caption("→ See Conversations tab to pick a time")
+                st.divider()
+
+
+# ----------------------------- TAB 7: DASHBOARD (internal) -----------------------------
 with tab_dashboard:
     if not staff_ok:
         staff_login_prompt("dashboard")
@@ -538,6 +680,64 @@ with tab_dashboard:
             if st.button("Save guidelines"):
                 set_setting("brand_guidelines", new_guidelines)
                 st.success("Saved — applies to new drafts going forward.")
+
+        with st.expander("📚 Approved knowledge base"):
+            st.caption(
+                "Real facts (pricing, features, policies) the AI can confidently reference when "
+                "answering a lead's questions/objections. If a question isn't covered here, the AI "
+                "will flag it for your review instead of guessing."
+            )
+            current_knowledge = get_setting("knowledge_base", "")
+            new_knowledge = st.text_area(
+                "Knowledge base",
+                value=current_knowledge,
+                height=150,
+                placeholder="e.g. Pricing: $99/month for up to 10 users, $199/month unlimited.\nIntegrates with Shopify, WooCommerce, and Stripe.\nSetup typically takes 3-5 business days.",
+            )
+            if st.button("Save knowledge base"):
+                set_setting("knowledge_base", new_knowledge)
+                st.success("Saved — applies to new drafts going forward.")
+
+        with st.expander("🤖 Autonomy controls"):
+            st.caption(
+                "By default, EVERY message needs your approval before sending. "
+                "You can allow specific action types to send automatically — optionally only "
+                "below a certain deal value, so high-value opportunities always get a human look."
+            )
+            current_policy = get_policy()
+            action_labels = {
+                "initial": "Initial outreach (first contact with a new lead)",
+                "followup": "Reply to a lead's message",
+                "nudge": "Follow-up nudge (lead gone quiet)",
+                "meeting_confirmation": "Meeting confirmation",
+            }
+            updated_policy = {}
+            for action_type in ACTION_TYPES:
+                rule = current_policy.get(action_type, {"auto_approve": False, "max_value": None})
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    auto = st.checkbox(
+                        f"Auto-send: {action_labels.get(action_type, action_type)}",
+                        value=rule.get("auto_approve", False),
+                        key=f"policy_auto_{action_type}",
+                    )
+                with col2:
+                    max_val = st.number_input(
+                        "Max deal value ($, blank = no limit)",
+                        min_value=0.0,
+                        value=float(rule["max_value"]) if rule.get("max_value") is not None else 0.0,
+                        step=100.0,
+                        key=f"policy_max_{action_type}",
+                        disabled=not auto,
+                    )
+                updated_policy[action_type] = {
+                    "auto_approve": auto,
+                    "max_value": max_val if (auto and max_val > 0) else None,
+                }
+
+            if st.button("Save autonomy settings"):
+                set_policy(updated_policy)
+                st.success("Saved.")
 
         st.subheader("Analytics")
 

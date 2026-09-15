@@ -41,7 +41,22 @@ FOLLOWUP_QUESTIONS = {
     "timeline": "What's your timeline for getting this in place?",
 }
 
-MAX_FOLLOWUP_ROUNDS = 1  # ask at most three times, so we don't pester the lead
+MAX_FOLLOWUP_ROUNDS = int(os.environ.get("FOLLOWUP_MAX_ROUNDS", "2"))  # V3: raised from 1, agent can ask more than once
+
+DYNAMIC_QUESTION_SYSTEM_PROMPT = """You are qualifying a sales lead. You'll be given what's already \
+known about them and a list of fields still missing: use_case, budget, authority, timeline.
+
+Choose the SINGLE most valuable missing field to ask about next — the one whose answer would most \
+help a salesperson understand if this is a good-fit, ready-to-buy lead. Then phrase one natural, \
+low-effort, friendly question to get that specific piece of information. Reference what they've \
+already told you if relevant, so it doesn't feel like a generic form question.
+
+Return ONLY a valid JSON object with exactly these keys:
+- "targeting_field": one of "use_case", "budget", "authority", "timeline" (must be one of the missing fields given)
+- "question": the question to ask (string)
+
+Do not include any text before or after the JSON object. Do not use markdown code fences.
+"""
 
 SYSTEM_PROMPT = """You are a sales qualification assistant. Extract structured information \
 from what a lead has said about their needs.
@@ -80,7 +95,7 @@ def _call_llm(lead_message: str, extra_context: str = "") -> str:
     return response.choices[0].message.content.strip()
 
 
-def _parse_json_response(raw_text: str) -> dict | None:
+def _parse_json_response(raw_text: str, required_fields: list[str] = None) -> dict | None:
     """Try to parse the model's response as JSON. Strips markdown fences if present."""
     text = raw_text.strip()
     if text.startswith("```"):
@@ -94,7 +109,8 @@ def _parse_json_response(raw_text: str) -> dict | None:
     except json.JSONDecodeError:
         return None
 
-    if not all(field in data for field in REQUIRED_FIELDS):
+    fields_to_check = required_fields if required_fields is not None else REQUIRED_FIELDS
+    if not all(field in data for field in fields_to_check):
         return None
 
     return data
@@ -127,6 +143,52 @@ def extract_requirements(lead_message: str, extra_context: str = "") -> dict:
 def get_missing_fields(requirements: dict) -> list[str]:
     """Returns required fields that are still empty, in priority order."""
     return [f for f in FOLLOWUP_PRIORITY if not (requirements.get(f) or "").strip()]
+
+
+def _call_llm_with_prompt(system_prompt: str, user_content: str) -> str:
+    """Like _call_llm but with a caller-supplied system prompt (used for non-extraction calls, e.g. dynamic question selection)."""
+    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.3,
+        max_tokens=600,
+        reasoning_effort="low",
+    )
+    return response.choices[0].message.content.strip()
+
+
+def choose_followup_question(requirements: dict, missing: list[str]) -> dict:
+    """
+    V3 — dynamic qualification: asks the LLM to pick the single most
+    valuable missing field and phrase a natural, contextual question for
+    it, rather than always following a fixed priority order + template.
+
+    The DECISION of what's missing (get_missing_fields) stays deterministic
+    business logic; only WHICH one to prioritize and HOW to phrase it is
+    delegated to the LLM here — a conversational choice, not a business
+    rule like scoring or approval.
+
+    Falls back to the fixed template (old V1/V2 behavior) if the LLM call
+    fails or returns something unusable, so this never breaks the pipeline.
+    """
+    known = {k: v for k, v in requirements.items() if v}
+    context = f"Known so far: {known}\nMissing fields: {missing}"
+
+    try:
+        raw = _call_llm_with_prompt(DYNAMIC_QUESTION_SYSTEM_PROMPT, context)
+        parsed = _parse_json_response(raw, required_fields=["targeting_field", "question"])
+        if parsed and parsed.get("targeting_field") in missing and parsed.get("question"):
+            return {"question": parsed["question"], "targeting_field": parsed["targeting_field"]}
+    except Exception as e:
+        print(f"[qualify] Dynamic question selection failed, using fallback template: {e}")
+
+    # Fallback: fixed priority order + canned template (always works, never fails to parse)
+    fallback_field = missing[0]
+    return {"question": FOLLOWUP_QUESTIONS[fallback_field], "targeting_field": fallback_field}
 
 
 def _save_requirements(lead_id: int, requirements: dict, timestamp: str):
@@ -174,7 +236,8 @@ def qualify_lead(lead_id: int) -> dict:
     followup_rounds = lead.get("followup_rounds", 0) or 0
 
     if missing and followup_rounds < MAX_FOLLOWUP_ROUNDS:
-        question = FOLLOWUP_QUESTIONS[missing[0]]
+        chosen = choose_followup_question(requirements, missing)
+        question = chosen["question"]
         with get_conn() as conn:
             conn.execute(
                 """
@@ -184,7 +247,7 @@ def qualify_lead(lead_id: int) -> dict:
                 """,
                 (question, timestamp, lead_id),
             )
-        log_activity(lead_id, "followup_requested", f"Asked about missing field(s) {missing}: '{question}'")
+        log_activity(lead_id, "followup_requested", f"Asked about '{chosen['targeting_field']}' (missing: {missing}): '{question}'")
         return {"status": "awaiting_info", "requirements": requirements, "question": question}
 
     with get_conn() as conn:

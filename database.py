@@ -1,32 +1,160 @@
 """
 database.py
-V1 database layer — plain SQLite, no ORM, no server needed.
-Deployable as-is on Streamlit Community Cloud (file-based DB).
+V1 database layer — now backed by Turso (libSQL) instead of a local SQLite file,
+so data survives Streamlit Community Cloud reboots / redeploys / sleep-wake cycles.
 
-Tables (V1 scope only — see blueprint):
-- leads
-- lead_requirements
-- activity_log  (simple audit trail for V1)
+Why this file changes and nothing else does:
+Every other module (leads.py, draft.py, opportunities.py, ...) only ever talks to
+the database through `get_conn()`, using `conn.execute(sql, params)`,
+`cursor.lastrowid`, `dict(row)` and `row["col"]`. This file provides a thin
+compatibility layer so all of that keeps working unmodified, while the actual
+storage is now a remote, persistent libSQL database (Turso's free tier).
+
+Local development still works with zero setup: if no Turso credentials are
+found, it transparently falls back to the old local sqlite_agent.db file.
+
+We use the `libsql-client` package (NOT libsql-experimental). libsql-experimental
+compiles a Rust extension on install (needs Cargo/maturin and can hang or fail
+on machines without a Rust toolchain). libsql-client is pure Python, talks to
+Turso over HTTP/WebSocket, and is what Turso's own docs recommend as the
+stable client — `pip install libsql-client` just works, no compiler needed.
+
+Setup:
+1. pip install libsql-client   (added to requirements.txt)
+2. In the Turso dashboard (or `turso db create sales-agent`), create a NEW,
+   empty database — don't upload a .sql file, init_db() below creates all
+   the tables automatically the first time the app runs.
+3. Get the URL + token:
+     turso db show --url sales-agent
+     turso db tokens create sales-agent
+4. Locally: put them in a .env file:
+     TURSO_DATABASE_URL=libsql://sales-agent-yourorg.turso.io
+     TURSO_AUTH_TOKEN=eyJ...
+   On Streamlit Community Cloud: put the same two keys in
+   App -> Settings -> Secrets (TOML format, same key names).
 """
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-DB_PATH = "sales_agent.db"
+from dotenv import load_dotenv
+load_dotenv()  # so TURSO_DATABASE_URL / TURSO_AUTH_TOKEN are picked up even
+                # when this file (or a script that imports it) is run directly,
+                # not just through app.py
+
+DB_PATH = "sales_agent.db"  # local dev fallback only
+
+
+# ---------------------------------------------------------------------------
+# Credential lookup — works from .env locally and from st.secrets on Cloud
+# ---------------------------------------------------------------------------
+def _get_turso_credentials():
+    url = os.environ.get("TURSO_DATABASE_URL")
+    token = os.environ.get("TURSO_AUTH_TOKEN")
+
+    if not url or not token:
+        try:
+            import streamlit as st
+            url = url or st.secrets.get("TURSO_DATABASE_URL")
+            token = token or st.secrets.get("TURSO_AUTH_TOKEN")
+        except Exception:
+            pass
+
+    return url, token
+
+
+def _to_http_url(url: str) -> str:
+    """libsql:// and wss:// both mean 'use WebSocket' to libsql-client, which
+    has been hitting a handshake error against current Turso servers. https://
+    forces the simpler HTTP transport instead (fine for us — we don't use
+    multi-statement transactions)."""
+    if url.startswith("libsql://"):
+        return "https://" + url[len("libsql://"):]
+    if url.startswith("wss://"):
+        return "https://" + url[len("wss://"):]
+    return url
+
+
+_TURSO_URL, _TURSO_TOKEN = _get_turso_credentials()
+if _TURSO_URL:
+    _TURSO_URL = _to_http_url(_TURSO_URL)
+_USE_TURSO = bool(_TURSO_URL and _TURSO_TOKEN)
+
+if _USE_TURSO:
+    import libsql_client
+
+
+# ---------------------------------------------------------------------------
+# Compatibility wrapper: makes libsql_client's Client/ResultSet behave like
+# sqlite3's Connection/Cursor (dict-style rows + cursor.lastrowid), which is
+# what the rest of the app already assumes.
+# ---------------------------------------------------------------------------
+class _CursorProxy:
+    def __init__(self, result_set, client):
+        self._rs = result_set
+        self._client = client
+        self._idx = 0
+
+    def fetchone(self):
+        if self._idx >= len(self._rs.rows):
+            return None
+        row = self._rs.rows[self._idx]
+        self._idx += 1
+        return dict(zip(self._rs.columns, row))
+
+    def fetchall(self):
+        rows = [dict(zip(self._rs.columns, r)) for r in self._rs.rows[self._idx:]]
+        self._idx = len(self._rs.rows)
+        return rows
+
+    @property
+    def lastrowid(self):
+        # Ask the same session for the rowid of the row just inserted — this
+        # works because libSQL speaks the same SQL dialect as SQLite.
+        rs = self._client.execute("SELECT last_insert_rowid()")
+        return rs.rows[0][0]
+
+
+class _ConnProxy:
+    def __init__(self, client):
+        self._client = client
+
+    def execute(self, sql, params=()):
+        rs = self._client.execute(sql, list(params) if params else [])
+        return _CursorProxy(rs, self._client)
+
+    def commit(self):
+        pass  # libsql-client statements commit as they run; nothing to flush
+
+    def close(self):
+        self._client.close()
 
 
 @contextmanager
 def get_conn():
-    """Context-managed SQLite connection with row access by column name."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+    """Context-managed connection with row access by column name.
+
+    Uses Turso (remote, persistent) if TURSO_DATABASE_URL/TURSO_AUTH_TOKEN are
+    set; otherwise falls back to the local sqlite file for easy local dev.
+    """
+    if _USE_TURSO:
+        client = libsql_client.create_client_sync(_TURSO_URL, auth_token=_TURSO_TOKEN)
+        conn = _ConnProxy(client)
+        try:
+            yield conn
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def init_db():
@@ -40,14 +168,15 @@ def init_db():
                 phone TEXT,
                 company TEXT,
                 source TEXT,
-                message TEXT,                     -- the lead's original inquiry/message, for retry if AI steps fail
-                status TEXT DEFAULT 'new',       -- new | awaiting_info | qualifying | qualified | drafted | sent | send_failed | replied | opted_out | rejected
-                pending_question TEXT,            -- follow-up question waiting on the lead's reply, if any
-                followup_rounds INTEGER DEFAULT 0,  -- how many follow-up questions have been asked (capped)
-                nudge_count INTEGER DEFAULT 0,    -- how many "haven't heard back" follow-ups sent (capped, V2)
-                telegram_chat_id TEXT,             -- set once the lead starts our Telegram bot (V2)
+                message TEXT,
+                status TEXT DEFAULT 'new',
+                pending_question TEXT,
+                followup_rounds INTEGER DEFAULT 0,
+                nudge_count INTEGER DEFAULT 0,
+                telegram_chat_id TEXT,
+                escalation_note TEXT,
                 score INTEGER,
-                score_reasons TEXT,               -- human-readable explanation of the score
+                score_reasons TEXT,
                 created_at TEXT,
                 updated_at TEXT
             )
@@ -71,7 +200,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS activity_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 lead_id INTEGER NOT NULL,
-                action TEXT,          -- e.g. 'lead_created', 'qualified', 'scored', 'draft_created', 'approved', 'sent', 'rejected'
+                action TEXT,
                 detail TEXT,
                 created_at TEXT,
                 FOREIGN KEY (lead_id) REFERENCES leads (id)
@@ -82,12 +211,14 @@ def init_db():
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 lead_id INTEGER NOT NULL,
-                channel TEXT DEFAULT 'email',     -- email | whatsapp
-                direction TEXT DEFAULT 'outbound', -- outbound (our drafts) | inbound (lead's replies, V2)
-                subject TEXT,                      -- used for email; blank for whatsapp
+                channel TEXT DEFAULT 'email',
+                direction TEXT DEFAULT 'outbound',
+                subject TEXT,
                 body TEXT,
-                approval_status TEXT DEFAULT 'pending',  -- pending | approved | edited | rejected | received (inbound)
-                external_id TEXT,                  -- email Message-ID, prevents re-importing the same reply twice
+                approval_status TEXT DEFAULT 'pending',
+                external_id TEXT,
+                needs_escalation INTEGER DEFAULT 0,
+                escalation_reason TEXT,
                 created_at TEXT,
                 decided_at TEXT,
                 FOREIGN KEY (lead_id) REFERENCES leads (id)
@@ -98,10 +229,10 @@ def init_db():
             CREATE TABLE IF NOT EXISTS research_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 lead_id INTEGER NOT NULL,
-                source TEXT,           -- e.g. 'web_search'
-                finding TEXT,          -- the actual snippet/fact found
-                evidence_url TEXT,     -- where this came from, for verification
-                retrieved_at TEXT,     -- timestamp, so staleness is visible
+                source TEXT,
+                finding TEXT,
+                evidence_url TEXT,
+                retrieved_at TEXT,
                 FOREIGN KEY (lead_id) REFERENCES leads (id)
             )
         """)
@@ -110,9 +241,9 @@ def init_db():
             CREATE TABLE IF NOT EXISTS opportunities (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 lead_id INTEGER NOT NULL,
-                stage TEXT DEFAULT 'new',       -- new | qualified | proposal | negotiation | won | lost
-                value REAL,                      -- estimated deal value
-                probability INTEGER,             -- 0-100, win likelihood
+                stage TEXT DEFAULT 'new',
+                value REAL,
+                probability INTEGER,
                 next_action TEXT,
                 created_at TEXT,
                 updated_at TEXT,
@@ -127,7 +258,7 @@ def init_db():
                 calendar_event_id TEXT,
                 start_at TEXT,
                 end_at TEXT,
-                status TEXT DEFAULT 'scheduled',  -- scheduled | cancelled
+                status TEXT DEFAULT 'scheduled',
                 meet_link TEXT,
                 created_at TEXT,
                 FOREIGN KEY (lead_id) REFERENCES leads (id)
@@ -138,6 +269,15 @@ def init_db():
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS knowledge_base (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT,
+                answer TEXT,
+                created_at TEXT
             )
         """)
 
@@ -156,4 +296,5 @@ def log_activity(lead_id: int, action: str, detail: str = ""):
 
 if __name__ == "__main__":
     init_db()
-    print(f"Database initialized at ./{DB_PATH}")
+    where = "Turso (remote)" if _USE_TURSO else f"./{DB_PATH} (local fallback)"
+    print(f"Database initialized -> {where}")
