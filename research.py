@@ -79,20 +79,37 @@ def _extract_business_domain(email: str) -> str | None:
     return domain
 
 
-def research_company(lead_id: int, company_name: str) -> list[dict]:
+def research_company(lead_id: int, company_name: str, domain: str = "") -> list[dict]:
     """Searches for basic public info about a company. Returns the raw results found."""
     if not company_name.strip():
         return []
-    results = _search(f"{company_name} company overview")
+    # Exact-phrase quoting matters regardless of domain: an unquoted search
+    # for "GAUCHA GROUP LLC" can match "Gaucho Group Holdings" — a real,
+    # unrelated company — since search engines do fuzzy/partial matching on
+    # bare keywords. Quoting forces a much closer literal match.
+    query = f'"{company_name}" {domain} company overview'.strip() if domain else f'"{company_name}" company overview'
+    results = _search(query)
     _save_findings(lead_id, results, "web_search:company")
     return results
 
 
-def research_company_news(lead_id: int, company_name: str) -> list[dict]:
-    """V3 — a second angle: recent news/updates, so research isn't limited to a static 'about' snapshot."""
+def research_company_news(lead_id: int, company_name: str, domain: str = "") -> list[dict]:
+    """
+    V3 — a second angle: recent news/updates, so research isn't limited to a
+    static 'about' snapshot.
+
+    IMPORTANT: company names are not unique, and even exact-phrase quoting
+    can't fully eliminate mismatches (a company might rename, or another
+    entity might use nearly the same name). Every finding must be verified
+    via its source link before being trusted or referenced in outreach —
+    this has actually happened: an unquoted search for "GAUCHA GROUP LLC"
+    matched news about "Gaucho Group Holdings", an unrelated public company
+    in bankruptcy proceedings, purely on loose keyword similarity.
+    """
     if not company_name.strip():
         return []
-    results = _search(f"{company_name} news recent")
+    query = f'"{company_name}" {domain} news' if domain else f'"{company_name}" news'
+    results = _search(query)
     _save_findings(lead_id, results, "web_search:news")
     return results
 
@@ -106,12 +123,44 @@ def research_company_website(lead_id: int, domain: str) -> list[dict]:
     return results
 
 
-def research_contact(lead_id: int, person_name: str, company_name: str = "") -> list[dict]:
-    """Searches for basic public info about the contact person. Returns the raw results found."""
+def _flag_unverified_contact_matches(results: list[dict], company_name: str) -> list[dict]:
+    """
+    If a 'contact' search result doesn't mention the company name anywhere,
+    that's a strong signal it's a different person with the same name —
+    prepend a visible warning to the stored finding text itself, so it's
+    impossible to miss even without clicking through to the source.
+    """
+    if not company_name.strip():
+        return results
+    tagged = []
+    for r in results:
+        combined = f"{r.get('title', '')} {r.get('body', '')}".lower()
+        if company_name.lower() not in combined:
+            r = dict(r)
+            original = r.get("body", r.get("title", ""))
+            r["body"] = f"⚠️ UNVERIFIED — company name not found in this result, may be a different person: {original}"
+        tagged.append(r)
+    return tagged
+
+
+def research_contact(lead_id: int, person_name: str, company_name: str = "", domain: str = "") -> list[dict]:
+    """
+    Searches for basic public info about the contact person. Returns the raw results found.
+
+    IMPORTANT: common names return many false-positive matches on free search
+    (there is no identity verification, unlike paid tools like Clearbit).
+    Quoting both name and company as exact phrases, plus the domain when
+    known, narrows this — but every finding must still be verified via its
+    source link. A same-name LinkedIn profile from a completely unrelated
+    person is a real, frequent risk with this free-tier approach. Results
+    that don't even mention the company name get an explicit warning prefix.
+    """
     if not person_name.strip():
         return []
-    query = f"{person_name} {company_name} linkedin".strip()
+    company_part = f'"{company_name}"' if company_name.strip() else ""
+    query = f'"{person_name}" {company_part} {domain} linkedin'.strip()
     results = _search(query)
+    results = _flag_unverified_contact_matches(results, company_name)
     _save_findings(lead_id, results, "web_search:contact")
     return results
 
@@ -119,10 +168,10 @@ def research_contact(lead_id: int, person_name: str, company_name: str = "") -> 
 def research_lead(lead_id: int) -> dict:
     """
     Full research pipeline for a given lead: company overview, company
-    news, contact, and (if applicable) their business domain directly.
-    Always succeeds (soft-fails internally) since this is a P1 enrichment
-    step, not a P0 gate — a lead should never get stuck here.
-    Returns counts per source angle.
+    news, contact, business domain search, AND (V4-A) direct website
+    fetch + tech-stack fingerprinting. Always succeeds (soft-fails
+    internally) since this is a P1 enrichment step, not a P0 gate — a
+    lead should never get stuck here. Returns counts per source angle.
     """
     lead = get_lead(lead_id)
     if lead is None:
@@ -132,10 +181,17 @@ def research_lead(lead_id: int) -> dict:
     person_name = lead.get("name") or ""
     domain = _extract_business_domain(lead.get("email") or "")
 
-    company_results = research_company(lead_id, company_name)
-    news_results = research_company_news(lead_id, company_name)
-    contact_results = research_contact(lead_id, person_name, company_name)
+    company_results = research_company(lead_id, company_name, domain or "")
+    news_results = research_company_news(lead_id, company_name, domain or "")
+    contact_results = research_contact(lead_id, person_name, company_name, domain or "")
     website_results = research_company_website(lead_id, domain) if domain else []
+
+    # V4-A: free website enrichment (title, meta description, tech stack)
+    try:
+        from enrichment import enrich_company
+        enrich_company(lead_id)
+    except Exception as e:
+        print(f"[research] Enrichment step failed (non-blocking): {e}")
 
     total_found = len(company_results) + len(news_results) + len(contact_results) + len(website_results)
     log_activity(

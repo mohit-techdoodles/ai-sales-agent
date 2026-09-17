@@ -21,7 +21,8 @@ from calendar_booking import get_meetings_for_lead
 
 load_dotenv()
 
-MODEL = "openai/gpt-oss-120b"
+from model_tiers import MODEL_REASONING
+MODEL = MODEL_REASONING  # V4-B: briefing synthesis needs careful judgment, stays on the reasoning tier
 
 BRIEFING_SYSTEM_PROMPT = """You are preparing a pre-call briefing for a salesperson, based ONLY on \
 the verified facts given to you below. Do not invent or infer anything not explicitly stated.
@@ -33,12 +34,16 @@ Write a concise briefing with these sections:
 4. **Key conversation points** — anything notable they said (questions, concerns, objections, specific requests)
 5. **Suggested talking points** — 2-3 things worth raising on the call, based ONLY on what's actually known
 
-Keep it tight — a salesperson should be able to read this in under a minute before a call. \
+IMPORTANT: research findings come from free public web search with no identity verification — a
+result may actually be about a different person or company that happens to share a similar name
+(this has happened in practice). Any finding marked "⚠️ UNVERIFIED" must NOT be stated as fact —
+mention it only as "unverified, needs checking" if at all. For other research findings, stay
+cautious rather than presenting them as certain, especially for common names or generic company names.Keep it tight — a salesperson should be able to read this in under a minute before a call. \
 Use plain text with clear section headers, no markdown tables.
 """
 
 
-def _build_context(lead: dict, requirements: dict, research_findings: list[dict], thread: list[dict], opportunity: dict | None, meetings: list[dict]) -> str:
+def _build_context(lead: dict, requirements: dict, research_findings: list[dict], thread: list[dict], opportunity: dict | None, meetings: list[dict], enrichment_data: dict | None = None) -> str:
     lines = [f"Lead: {lead.get('name', '')}"]
     if lead.get("company"):
         lines.append(f"Company: {lead['company']}")
@@ -58,6 +63,15 @@ def _build_context(lead: dict, requirements: dict, research_findings: list[dict]
         for field in ("use_case", "budget", "authority", "timeline", "notes"):
             if requirements.get(field):
                 lines.append(f"- {field}: {requirements[field]}")
+
+    if enrichment_data:
+        lines.append(f"\nCompany website ({enrichment_data.get('domain', '')}):")
+        if enrichment_data.get("page_title"):
+            lines.append(f"- Page title: {enrichment_data['page_title']}")
+        if enrichment_data.get("meta_description"):
+            lines.append(f"- Description: {enrichment_data['meta_description']}")
+        if enrichment_data.get("tech_stack"):
+            lines.append(f"- Detected tech stack: {', '.join(enrichment_data['tech_stack'])}")
 
     if research_findings:
         lines.append("\nResearch findings (from public web search):")
@@ -89,8 +103,9 @@ def generate_briefing(lead_id: int) -> str:
     Compiles a pre-call briefing for a lead. Returns plain-text briefing.
     Raises ValueError if the lead doesn't exist.
     """
-    # Local import to avoid circular import at module load time.
+    # Local imports to avoid circular imports at module load time.
     from replies import get_conversation
+    from enrichment import get_company_enrichment
 
     lead = get_lead(lead_id)
     if lead is None:
@@ -101,8 +116,9 @@ def generate_briefing(lead_id: int) -> str:
     thread = get_conversation(lead_id)
     opportunity = get_opportunity_for_lead(lead_id)
     meetings = get_meetings_for_lead(lead_id)
+    enrichment_data = get_company_enrichment(lead_id)
 
-    context = _build_context(lead, requirements, research_findings, thread, opportunity, meetings)
+    context = _build_context(lead, requirements, research_findings, thread, opportunity, meetings, enrichment_data)
 
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
     response = client.chat.completions.create(

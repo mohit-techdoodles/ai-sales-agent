@@ -25,7 +25,8 @@ from leads import get_lead
 
 load_dotenv()
 
-MODEL = "openai/gpt-oss-120b"  # current Groq production model, good for structured extraction
+from model_tiers import MODEL_LIGHT
+MODEL = MODEL_LIGHT  # V4-B: structured extraction + question selection are "light" tasks per hierarchical routing  # current Groq production model, good for structured extraction
 # Note: llama-3.3-70b-versatile was decommissioned by Groq on Aug 16, 2026.
 # If this model is ever retired too, check https://console.groq.com/docs/models
 

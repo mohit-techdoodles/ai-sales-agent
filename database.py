@@ -281,6 +281,32 @@ def init_db():
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS company_enrichment (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER NOT NULL,
+                domain TEXT,
+                page_title TEXT,
+                meta_description TEXT,
+                tech_stack TEXT,
+                fetched_at TEXT,
+                FOREIGN KEY (lead_id) REFERENCES leads (id)
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS faq_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                question TEXT,
+                answer TEXT,
+                embedding TEXT,            -- JSON-encoded list of floats
+                hit_count INTEGER DEFAULT 0,
+                last_accessed_at TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        """)
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()

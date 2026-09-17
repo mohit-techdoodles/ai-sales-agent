@@ -20,11 +20,12 @@ from dotenv import load_dotenv
 
 from database import init_db
 from leads import receive_lead, list_leads, get_lead, mark_opted_out
-from qualify import qualify_lead, submit_followup_answer
+from qualify import qualify_lead, submit_followup_answer, MAX_FOLLOWUP_ROUNDS
 from scoring import score_lead
 from draft import generate_draft, get_pending_messages_for_lead, list_all_messages, get_lead_ids_with_pending_messages, generate_meeting_confirmation_draft
 from approval import approve_message, edit_and_approve_message, reject_message
 from research import research_lead, get_research, get_research_freshness
+from enrichment import get_company_enrichment
 from replies import check_for_replies, get_conversation
 from followup import get_leads_due_for_followup, generate_nudge_draft, FOLLOWUP_DUE_DAYS, MAX_NUDGES
 import opportunities as opp
@@ -52,6 +53,15 @@ st.set_page_config(page_title="AI Sales Agent — V1", layout="wide")
 init_db()
 
 st.title("AI Sales Agent — V1 Copilot")
+import re
+
+def is_valid_phone(phone: str) -> bool:
+    """Permissive international validation — allows digits + common formatting characters."""
+    phone = phone.strip()
+    if not phone:
+        return True  # phone is optional
+    digits_only = re.sub(r"[\s\-\+\(\)\.]", "", phone)
+    return digits_only.isdigit() and 7 <= len(digits_only) <= 15
 
 
 def is_staff() -> bool:
@@ -160,6 +170,8 @@ with tab_new:
     if submitted:
         if not name or not message:
             st.error("Name and message are required.")
+        elif not is_valid_phone(phone):
+            st.error("Phone number doesn't look valid — please check it (7-15 digits, formatting characters like +, -, () are fine).")
         else:
             lead = receive_lead(name=name, email=email, phone=phone, company=company, source="streamlit_form", message=message)
 
@@ -169,10 +181,8 @@ with tab_new:
                 try:
                     result = run_ai_pipeline(lead["id"])
                     st.success("Thanks for reaching out! We'll be in touch shortly.")
-                    # Internal details (score/question) intentionally NOT shown to the public visitor.
                 except Exception:
                     st.success("Thanks for reaching out! We'll be in touch shortly.")
-                    # Lead is saved regardless; staff can retry processing from the Dashboard tab.
 
 
 # ----------------------------- TAB 2: NEEDS INFO (internal) -----------------------------
@@ -188,25 +198,33 @@ with tab_followup:
             st.info("No leads currently waiting on follow-up info.")
 
         for lead in awaiting_leads:
-            with st.expander(f"{lead['name']} — {lead['company'] or 'no company'}", expanded=True):
+            round_num = lead.get("followup_rounds", 0) or 0
+            with st.expander(f"{lead['name']} — {lead['company'] or 'no company'} (question {round_num} of {MAX_FOLLOWUP_ROUNDS})", expanded=True):
                 st.markdown(f"**Question to ask the lead:** {lead['pending_question']}")
                 st.caption(f"Original message: {lead['message']}")
 
-                answer = st.text_input("Lead's reply", key=f"followup_answer_{lead['id']}")
+                # IMPORTANT: the key includes followup_rounds, so each new
+                # question round gets a genuinely fresh, empty text box —
+                # without this, Streamlit reuses the previous round's typed
+                # answer since the widget key would otherwise stay identical.
+                answer = st.text_input("Lead's reply", key=f"followup_answer_{lead['id']}_{round_num}")
 
-                if st.button("Submit answer & continue", key=f"followup_submit_{lead['id']}"):
+                if st.button("Submit answer & continue", key=f"followup_submit_{lead['id']}_{round_num}"):
                     if not answer.strip():
                         st.error("Enter the lead's answer first.")
                     else:
                         try:
                             qual_result = submit_followup_answer(lead["id"], answer)
                             if qual_result["status"] == "awaiting_info":
-                                st.info(f"Still need more info: \"{qual_result['question']}\"")
+                                st.info(f"Next question: \"{qual_result['question']}\"")
                             else:
                                 with st.spinner("Scoring and drafting..."):
                                     score_result = score_lead(lead["id"])
-                                    generate_draft(lead["id"])
-                                st.success(f"Qualified! Score: {score_result['score']}/100 — draft ready in Approval Inbox.")
+                                    draft_result = generate_draft(lead["id"])
+                                if maybe_auto_approve(draft_result["message_id"], lead["id"], draft_result["mode"], draft_result.get("needs_escalation", False)):
+                                    st.success(f"Qualified! Score: {score_result['score']}/100 — auto-approved and sent per autonomy settings.")
+                                else:
+                                    st.success(f"Qualified! Score: {score_result['score']}/100 — draft ready in Approval Inbox.")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Failed to process answer: {e}")
@@ -255,6 +273,7 @@ with tab_inbox:
                     if findings:
                         staleness_note = f" ⚠️ {freshness['days_old']} days old — consider refreshing" if freshness["is_stale"] else f" (updated {freshness['days_old']}d ago)"
                         st.markdown(f"**Research findings**{staleness_note}")
+                        st.caption("⚠️ Free search has no identity verification — a result may be about a different person/company with a similar name. Always check the source link before referencing this in outreach.")
                         for f in findings[:5]:  # keep it compact
                             st.caption(f"🔍 {f['finding']}")
                             st.caption(f"[source]({f['evidence_url']}) · {f['retrieved_at'][:10]}")
@@ -267,6 +286,14 @@ with tab_inbox:
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Couldn't refresh: {e}")
+
+                    enrichment_data = get_company_enrichment(lead["id"])
+                    if enrichment_data:
+                        st.markdown("**Website enrichment**")
+                        if enrichment_data.get("page_title"):
+                            st.caption(f"📄 {enrichment_data['page_title']}")
+                        if enrichment_data.get("tech_stack"):
+                            st.caption(f"🛠️ Tech: {', '.join(enrichment_data['tech_stack'])}")
 
                 btn_col1, btn_col2, btn_col3 = st.columns(3)
 
@@ -574,21 +601,23 @@ with tab_opportunities:
             st.caption("No eligible leads right now (needs to be past initial qualification, and not already tracked).")
         else:
             lead_options = {f"{l['name']} — {l['company'] or 'no company'} (status: {l['status']})": l["id"] for l in eligible_leads}
-            selected_label = st.selectbox("Lead", list(lead_options.keys()))
-            selected_lead_id = lead_options[selected_label]
 
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                init_stage = st.selectbox("Initial stage", opp.STAGES, index=0, key="new_opp_stage")
-            with c2:
-                init_value = st.number_input("Estimated value ($)", min_value=0.0, step=100.0, key="new_opp_value")
-            with c3:
-                init_probability = st.slider("Probability (%)", 0, 100, 25, key="new_opp_prob")
+            with st.form("new_opportunity_form", clear_on_submit=True):
+                selected_label = st.selectbox("Lead", list(lead_options.keys()))
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    init_stage = st.selectbox("Initial stage", opp.STAGES, index=0)
+                with c2:
+                    init_value = st.number_input("Estimated value ($)", min_value=0.0, step=100.0)
+                with c3:
+                    init_probability = st.slider("Probability (%)", 0, 100, 25)
+                init_next_action = st.text_input("Next action")
+                create_submitted = st.form_submit_button("Create opportunity")
 
-            init_next_action = st.text_input("Next action", key="new_opp_next")
-
-            if st.button("Create opportunity"):
-                opp.create_opportunity(selected_lead_id, stage=init_stage, value=init_value, probability=init_probability, next_action=init_next_action)
+            if create_submitted:
+                selected_lead_id = lead_options[selected_label]
+                with st.spinner("Creating opportunity..."):
+                    opp.create_opportunity(selected_lead_id, stage=init_stage, value=init_value, probability=init_probability, next_action=init_next_action)
                 st.success("Opportunity created.")
                 st.rerun()
 
@@ -697,6 +726,52 @@ with tab_dashboard:
             if st.button("Save knowledge base"):
                 set_setting("knowledge_base", new_knowledge)
                 st.success("Saved — applies to new drafts going forward.")
+
+        with st.expander("⚡ FAQ cache (instant answers, no AI call)"):
+            st.caption(
+                "For your most common questions, add an exact pre-written answer here. "
+                "When a lead's message closely matches (by meaning, not exact wording), that answer "
+                "is sent directly — skipping the AI drafting call entirely, for speed and lower cost."
+            )
+            try:
+                from semantic_cache import list_faqs, add_faq, delete_faq
+                faqs = list_faqs()
+
+                if faqs:
+                    for faq in faqs:
+                        with st.container():
+                            col1, col2 = st.columns([4, 1])
+                            with col1:
+                                st.write(f"**Q:** {faq['question']}")
+                                st.caption(f"A: {faq['answer']}")
+                                st.caption(f"Used {faq['hit_count']} time(s)")
+                            with col2:
+                                if st.button("Delete", key=f"del_faq_{faq['id']}"):
+                                    delete_faq(faq["id"])
+                                    st.rerun()
+                            st.divider()
+                else:
+                    st.caption("No FAQ entries yet.")
+
+                st.markdown("**Add a new FAQ**")
+                with st.form("new_faq_form", clear_on_submit=True):
+                    new_q = st.text_input("Question", placeholder="What's your pricing?")
+                    new_a = st.text_area("Answer", placeholder="Our pricing is $99/month for up to 10 users.")
+                    faq_submitted = st.form_submit_button("Add FAQ")
+
+                if faq_submitted:
+                    if new_q.strip() and new_a.strip():
+                        with st.spinner("Adding FAQ..."):
+                            result = add_faq(new_q, new_a)
+                        if result:
+                            st.success("Added.")
+                            st.rerun()
+                        else:
+                            st.error("Couldn't add FAQ — embedding model unavailable right now.")
+                    else:
+                        st.error("Both question and answer are required.")
+            except ImportError:
+                st.warning("FAQ caching requires the `sentence-transformers` package. Run: pip install sentence-transformers")
 
         with st.expander("🤖 Autonomy controls"):
             st.caption(

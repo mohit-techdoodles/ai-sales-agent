@@ -25,7 +25,8 @@ from qualify import get_requirements
 
 load_dotenv()
 
-MODEL = "openai/gpt-oss-120b"
+from model_tiers import MODEL_LIGHT, MODEL_REASONING
+MODEL = MODEL_REASONING  # kept for backward compatibility; explicit model= is used per-call below
 
 INITIAL_SYSTEM_PROMPT = """You are a sales development rep writing a first outreach email to a lead \
 who submitted an inquiry. Write ONLY based on the verified facts given to you — never invent \
@@ -170,7 +171,14 @@ def _build_meeting_confirmation_context(lead: dict, thread: list[dict], meeting_
     return "\n".join(lines)
 
 
-def _call_llm(system_prompt: str, context: str) -> str:
+def _call_llm(system_prompt: str, context: str, model: str = None) -> str:
+    # V4-B: hierarchical routing — callers pass model=MODEL_LIGHT for simple
+    # templated messages (initial/nudge/meeting confirmation) or leave the
+    # default (MODEL_REASONING) for objection handling, which needs more
+    # careful judgment about what's actually covered by approved knowledge.
+    if model is None:
+        model = MODEL_REASONING
+
     # V2 Templates (P1): staff-configured brand voice/positioning rules,
     # applied here so every drafting mode picks them up automatically.
     from settings import get_setting
@@ -188,7 +196,7 @@ def _call_llm(system_prompt: str, context: str) -> str:
 
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
     response = client.chat.completions.create(
-        model=MODEL,
+        model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": context},
@@ -255,31 +263,58 @@ def generate_draft(lead_id: int, channel: str = None) -> dict:
     if channel is None:
         channel = thread[-1]["channel"] if thread else "email"
 
+    cache_hit = None
     if has_replied:
+        # V4-B: semantic caching — check if the lead's latest message closely
+        # matches a staff-approved FAQ before spending a reasoning-tier LLM
+        # call on it. Fails soft (returns None) if the embedding model isn't
+        # available, so this never blocks normal drafting.
+        try:
+            from semantic_cache import find_matching_faq
+            latest_inbound = [m for m in thread if m["direction"] == "inbound"][-1]
+            cache_hit = find_matching_faq(latest_inbound["body"])
+        except Exception as e:
+            print(f"[draft] Semantic cache check failed (non-blocking): {e}")
+
+    if cache_hit:
         mode = "followup"
+        last_subject = next((m["subject"] for m in reversed(thread) if m.get("subject")), "")
+        parsed = {
+            "subject": f"Re: {last_subject}" if last_subject else "Re: your question",
+            "body": cache_hit["answer"],
+            "needs_escalation": False,
+            "escalation_reason": "",
+        }
+        log_activity(lead_id, "cache_hit", f"Matched FAQ #{cache_hit['id']} (similarity={cache_hit['similarity']}) — skipped LLM call")
+    elif has_replied:
+        mode = "followup"
+        model = MODEL_REASONING  # V4-B: objection handling needs careful judgment about approved knowledge
         system_prompt = FOLLOWUP_SYSTEM_PROMPT
         context = _build_conversation_context(lead, thread)
     elif has_outbound:
         mode = "nudge"
+        model = MODEL_LIGHT  # V4-B: a brief templated check-in is a simple task
         requirements = get_requirements(lead_id) or {}
         system_prompt = NUDGE_SYSTEM_PROMPT
         context = _build_nudge_context(lead, requirements, thread)
     else:
         mode = "initial"
+        model = MODEL_LIGHT  # V4-B: first-touch templated outreach is a simple task
         system_prompt = INITIAL_SYSTEM_PROMPT
         requirements = get_requirements(lead_id) or {}
         context = _build_initial_context(lead, requirements)
 
-    raw = _call_llm(system_prompt, context)
-    parsed = _parse_json_response(raw)
-
-    if parsed is None:
-        # Retry once with a stricter nudge, same pattern as qualify.py
-        raw = _call_llm(system_prompt, context + "\n\nIMPORTANT: Respond with ONLY the raw JSON object.")
+    if not cache_hit:
+        raw = _call_llm(system_prompt, context, model=model)
         parsed = _parse_json_response(raw)
 
-    if parsed is None:
-        raise RuntimeError(f"Could not parse valid JSON draft from LLM after retry. Last response:\n{raw}")
+        if parsed is None:
+            # Retry once with a stricter nudge, same pattern as qualify.py
+            raw = _call_llm(system_prompt, context + "\n\nIMPORTANT: Respond with ONLY the raw JSON object.", model=model)
+            parsed = _parse_json_response(raw)
+
+        if parsed is None:
+            raise RuntimeError(f"Could not parse valid JSON draft from LLM after retry. Last response:\n{raw}")
 
     timestamp = now_iso()
     needs_escalation = bool(parsed.get("needs_escalation", False))
@@ -303,10 +338,10 @@ def generate_draft(lead_id: int, channel: str = None) -> dict:
     log_activity(
         lead_id,
         "draft_created",
-        f"Draft message_id={message_id} (mode={mode}) subject='{parsed.get('subject', '')}'",
+        f"Draft message_id={message_id} (mode={mode}{', cache_hit' if cache_hit else ''}) subject='{parsed.get('subject', '')}'",
     )
 
-    return {"message_id": message_id, "subject": parsed.get("subject", ""), "body": parsed.get("body", ""), "mode": mode, "needs_escalation": needs_escalation}
+    return {"message_id": message_id, "subject": parsed.get("subject", ""), "body": parsed.get("body", ""), "mode": mode, "needs_escalation": needs_escalation, "cache_hit": bool(cache_hit)}
 
 
 def generate_meeting_confirmation_draft(lead_id: int, meeting_time_display: str, meet_link: str = "") -> dict:
@@ -328,11 +363,11 @@ def generate_meeting_confirmation_draft(lead_id: int, meeting_time_display: str,
     thread = get_conversation(lead_id)
     context = _build_meeting_confirmation_context(lead, thread, meeting_time_display, meet_link)
 
-    raw = _call_llm(MEETING_CONFIRMATION_SYSTEM_PROMPT, context)
+    raw = _call_llm(MEETING_CONFIRMATION_SYSTEM_PROMPT, context, model=MODEL_LIGHT)
     parsed = _parse_json_response(raw)
 
     if parsed is None:
-        raw = _call_llm(MEETING_CONFIRMATION_SYSTEM_PROMPT, context + "\n\nIMPORTANT: Respond with ONLY the raw JSON object.")
+        raw = _call_llm(MEETING_CONFIRMATION_SYSTEM_PROMPT, context + "\n\nIMPORTANT: Respond with ONLY the raw JSON object.", model=MODEL_LIGHT)
         parsed = _parse_json_response(raw)
 
     if parsed is None:
