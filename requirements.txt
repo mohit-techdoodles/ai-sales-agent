@@ -8,3 +8,7 @@ google-api-python-client
 requests
 libsql-client
 sentence-transformers
+pymupdf
+python-docx
+pytesseract
+pillow

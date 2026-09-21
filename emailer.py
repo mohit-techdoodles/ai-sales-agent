@@ -11,19 +11,27 @@ import os
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-def send_email(to_email: str, subject: str, body: str) -> dict:
+def send_email(to_email: str, subject: str, body: str,
+                attachment_filename: str = None, attachment_bytes: bytes = None) -> dict:
     """
     Sends a real email via SMTP if SEND_REAL_EMAILS=true and to_email is present.
     Otherwise, prints the email instead (safe dry-run mode).
+
+    attachment_filename/attachment_bytes: optional — if both are given, the
+    file is attached to the email (V5: sending a document/voice note back
+    to the lead, in addition to it informing the draft's content).
+
     Returns {"sent": bool, "method": "smtp" | "mocked", "error": str | None}
     """
     send_real_emails = os.environ.get("SEND_REAL_EMAILS", "false").strip().lower() == "true"
+    has_attachment = bool(attachment_filename and attachment_bytes)
 
     if not to_email:
         print("\n--- SEND SKIPPED (no email address on file) ---\n")
@@ -34,6 +42,8 @@ def send_email(to_email: str, subject: str, body: str) -> dict:
         print(f"To: {to_email}")
         print(f"Subject: {subject}")
         print(f"Body:\n{body}")
+        if has_attachment:
+            print(f"Attachment: {attachment_filename} ({len(attachment_bytes)} bytes)")
         print("--- END SEND ---\n")
         return {"sent": True, "method": "mocked", "error": None}
 
@@ -55,12 +65,17 @@ def send_email(to_email: str, subject: str, body: str) -> dict:
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain"))
 
+        if has_attachment:
+            part = MIMEApplication(attachment_bytes, Name=attachment_filename)
+            part["Content-Disposition"] = f'attachment; filename="{attachment_filename}"'
+            msg.attach(part)
+
         with smtplib.SMTP(host, port) as server:
             server.starttls()
             server.login(username, password)
             server.sendmail(username, to_email, msg.as_string())
 
-        print(f"--- EMAIL SENT to {to_email} ---")
+        print(f"--- EMAIL SENT to {to_email}{' with attachment ' + attachment_filename if has_attachment else ''} ---")
         return {"sent": True, "method": "smtp", "error": None}
 
     except Exception as e:

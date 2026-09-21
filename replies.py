@@ -85,11 +85,32 @@ def _get_plain_text_body(msg) -> str:
 
 
 QUOTE_MARKERS = [
-    r"\nOn .{0,120}?wrote:\s*\n",           # Gmail/most clients: "On <date>, <name> <email> wrote:"
-    r"\nOn .{0,120}?wrote:\s*$",             # same, at end of string with nothing after
-    r"\n-{2,}\s*Original Message\s*-{2,}",   # Outlook-style "-----Original Message-----"
-    r"\nFrom:\s*.+\nSent:\s*.+\nTo:\s*.+",   # Outlook-style quoted header block
+    r"^On .{0,120}?wrote:\s*$",                # Gmail/most clients: "On <date>, <name> <email> wrote:"
+    r"^-{2,}\s*Original Message\s*-{2,}\s*$",  # Outlook-style "-----Original Message-----"
+    r"^From:\s*.+\nSent:\s*.+\nTo:\s*.+",      # Outlook-style quoted header block
 ]
+
+
+def _drop_trailing_quote_lines(text: str) -> str:
+    """Keep lines up to (not including) the first '>'-prefixed quote line."""
+    lines = []
+    for line in text.split("\n"):
+        if line.strip().startswith(">"):
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _first_non_quoted_paragraph(text_from_marker: str) -> str:
+    """Given text starting AT a quote marker line, skip the marker itself
+    and any '>'-quoted / blank lines right after it, and return whatever
+    real content follows — this is the bottom-posting case, where the
+    lead's new reply comes AFTER the quoted block instead of before it."""
+    lines = text_from_marker.split("\n")
+    idx = 1  # skip the marker line itself
+    while idx < len(lines) and (lines[idx].strip().startswith(">") or not lines[idx].strip()):
+        idx += 1
+    return "\n".join(lines[idx:]).strip()
 
 
 def _strip_quoted_reply(body: str) -> str:
@@ -101,23 +122,32 @@ def _strip_quoted_reply(body: str) -> str:
     instead of just the new reply — a short "how much does this cost?"
     reply can otherwise carry hundreds of words of quoted boilerplate along
     with it, which meaningfully hurts embedding similarity matching.
+
+    Handles both reply styles: top-posting (new text above the "On...wrote:"
+    marker — most common in Gmail/Outlook) and bottom-posting/inline (marker
+    first, then the quoted lines, then the lead's new text below all of it —
+    common with plain IMAP clients, mailing-list-style replies, etc.).
     """
-    earliest_cut = len(body)
+    body = body.replace("\r\n", "\n")
+
+    earliest_cut = None
     for pattern in QUOTE_MARKERS:
         match = re.search(pattern, body, re.IGNORECASE | re.MULTILINE)
-        if match and match.start() < earliest_cut:
+        if match and (earliest_cut is None or match.start() < earliest_cut):
             earliest_cut = match.start()
 
-    # Also handle classic ">"-prefixed quote blocks (older clients)
-    lines = body[:earliest_cut].split("\n")
-    clean_lines = []
-    for line in lines:
-        if line.strip().startswith(">"):
-            break
-        clean_lines.append(line)
+    if earliest_cut is not None:
+        before_marker = _drop_trailing_quote_lines(body[:earliest_cut])
+        if before_marker:
+            return before_marker  # top-posting: new text was above the marker
 
-    cleaned = "\n".join(clean_lines).strip()
-    return cleaned if cleaned else body.strip()  # never return empty — fall back to raw if stripping ate everything
+        after_marker = _first_non_quoted_paragraph(body[earliest_cut:])
+        if after_marker:
+            return after_marker  # bottom-posting: new text is below the quoted block
+
+    # No marker found at all — just drop any leading ">"-quoted lines wherever they are.
+    stripped = _drop_trailing_quote_lines(body)
+    return stripped if stripped else body.strip()  # never return empty — fall back to raw if stripping ate everything
 
 
 def _parse_email(raw_bytes: bytes) -> dict:

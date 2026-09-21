@@ -265,13 +265,25 @@ def submit_followup_answer(lead_id: int, answer_text: str) -> dict:
     Appends the lead's reply to their stored message and re-runs qualification.
     Clears the pending_question. Since followup_rounds was already incremented
     when the question was asked, this second pass will proceed to 'qualifying'
-    even if a field is still missing (we only ask once, per MAX_FOLLOWUP_ROUNDS).
+    even if a field is still missing (we only ask up to MAX_FOLLOWUP_ROUNDS).
+
+    IMPORTANT: includes the ACTUAL QUESTION that was asked alongside the
+    answer, not just the raw answer text. Without this, a short answer like
+    "i am" (answering "who is the decision maker?") is meaningless to the
+    extraction model on its own — it has no way to attribute it to the
+    'authority' field, or any field at all.
     """
     lead = get_lead(lead_id)
     if lead is None:
         raise ValueError(f"Lead {lead_id} not found.")
 
-    combined_message = (lead.get("message") or "") + f"\n\nFollow-up answer: {answer_text}"
+    question_asked = lead.get("pending_question") or ""
+    if question_asked:
+        qa_block = f"\n\nWe asked: {question_asked}\nThey answered: {answer_text}"
+    else:
+        qa_block = f"\n\nFollow-up answer: {answer_text}"  # fallback if no question was on file
+
+    combined_message = (lead.get("message") or "") + qa_block
     timestamp = now_iso()
 
     with get_conn() as conn:
@@ -280,10 +292,9 @@ def submit_followup_answer(lead_id: int, answer_text: str) -> dict:
             (combined_message, timestamp, lead_id),
         )
 
-    log_activity(lead_id, "followup_answered", f"Lead replied: {answer_text}")
+    log_activity(lead_id, "followup_answered", f"Q: '{question_asked}' -> A: '{answer_text}'")
 
     return qualify_lead(lead_id)
-
 
 def reextract_from_reply(lead_id: int) -> dict:
     """

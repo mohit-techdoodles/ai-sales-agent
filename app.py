@@ -29,6 +29,9 @@ from enrichment import get_company_enrichment
 from replies import check_for_replies, get_conversation
 from followup import get_leads_due_for_followup, generate_nudge_draft, FOLLOWUP_DUE_DAYS, MAX_NUDGES
 import opportunities as opp
+from document_parser import extract_text_from_file
+from attachments import attach_document_to_lead, attach_voice_reply_to_lead
+from voice import transcribe_audio
 from calendar_booking import get_available_slots, book_meeting, get_meetings_for_lead, list_all_meetings
 from telegram_bot import get_telegram_link, check_for_telegram_updates
 from briefing import generate_briefing
@@ -161,19 +164,42 @@ with tab_new:
         phone = st.text_input("Phone")
         company = st.text_input("Company")
         message = st.text_area(
-            "What do you need? *",
+            "What do you need? (or leave blank and record a voice message below)",
             placeholder="e.g. We need a CRM for our 10-person sales team, budget around $300/month, want it within a month.",
             height=120,
+        )
+        voice_note = st.audio_input("Or record a voice message instead")
+        uploaded_file = st.file_uploader(
+            "Attach a spec, RFP, or requirements document (optional)",
+            type=["pdf", "docx", "png", "jpg", "jpeg"],
         )
         submitted = st.form_submit_button("Submit")
 
     if submitted:
-        if not name or not message:
-            st.error("Name and message are required.")
+        final_message = message
+
+        if voice_note is not None:
+            with st.spinner("Transcribing your voice message..."):
+                voice_result = transcribe_audio(voice_note.getvalue(), "recording.wav")
+            if voice_result["text"]:
+                final_message = (final_message + "\n\n" + voice_result["text"]).strip()
+            elif voice_result["error"]:
+                st.warning(f"Couldn't transcribe the voice message ({voice_result['error']}) — continuing with what was typed.")
+
+        if not name or not final_message:
+            st.error("Name and a message (typed or spoken) are required.")
         elif not is_valid_phone(phone):
             st.error("Phone number doesn't look valid — please check it (7-15 digits, formatting characters like +, -, () are fine).")
         else:
-            lead = receive_lead(name=name, email=email, phone=phone, company=company, source="streamlit_form", message=message)
+            if uploaded_file is not None:
+                with st.spinner("Reading attached document..."):
+                    doc_result = extract_text_from_file(uploaded_file.name, uploaded_file.getvalue())
+                if doc_result["text"]:
+                    final_message = final_message + f"\n\n--- Attached document ({uploaded_file.name}) ---\n" + doc_result["text"]
+                elif doc_result["error"]:
+                    st.warning(f"Couldn't read the attached file ({doc_result['error']}) — continuing without it.")
+
+            lead = receive_lead(name=name, email=email, phone=phone, company=company, source="streamlit_form", message=final_message)
 
             if lead.get("is_duplicate"):
                 st.info("Thanks — looks like we already have your inquiry on file. We'll be in touch!")
@@ -183,7 +209,6 @@ with tab_new:
                     st.success("Thanks for reaching out! We'll be in touch shortly.")
                 except Exception:
                     st.success("Thanks for reaching out! We'll be in touch shortly.")
-
 
 # ----------------------------- TAB 2: NEEDS INFO (internal) -----------------------------
 with tab_followup:
@@ -326,6 +351,46 @@ with tab_inbox:
                         reject_message(message["id"])
                         st.warning("Rejected. Nothing was sent.")
                         st.rerun()
+
+                with st.expander("📎 Attach a document or voice reply and re-process"):
+                    st.caption(
+                        "For info that arrived outside the web form — e.g. a document the lead "
+                        "emailed separately, or something said on a call. This supersedes the "
+                        "draft above with a new one that accounts for the new information, and "
+                        "the file/recording itself will be attached when that new draft is sent."
+                    )
+                    inbox_upload = st.file_uploader(
+                        "Document (RFP, spec, requirements)", type=["pdf", "docx", "png", "jpg", "jpeg"],
+                        key=f"inbox_upload_{lead['id']}",
+                    )
+                    if st.button("Add document & re-process", key=f"inbox_attach_{lead['id']}", disabled=inbox_upload is None):
+                        with st.spinner("Reading document and re-running qualification..."):
+                            attach_result = attach_document_to_lead(lead["id"], inbox_upload.name, inbox_upload.getvalue())
+                        if not attach_result["success"]:
+                            st.error(f"Couldn't process the attachment: {attach_result['error']}")
+                        else:
+                            new_draft = attach_result["draft"]
+                            if maybe_auto_approve(new_draft["message_id"], lead["id"], new_draft["mode"], new_draft.get("needs_escalation", False)):
+                                st.success(f"Document processed — score now {attach_result['score']}/100 — auto-approved and sent per autonomy settings (document attached).")
+                            else:
+                                st.success(f"Document processed — score now {attach_result['score']}/100 — new draft ready above (the file will be attached when you approve/send it).")
+                            st.rerun()
+
+                    st.divider()
+
+                    inbox_voice = st.audio_input("Or record a voice reply instead", key=f"inbox_voice_{lead['id']}")
+                    if st.button("Add voice reply & re-process", key=f"inbox_voice_attach_{lead['id']}", disabled=inbox_voice is None):
+                        with st.spinner("Transcribing and re-running qualification..."):
+                            voice_attach_result = attach_voice_reply_to_lead(lead["id"], inbox_voice.getvalue())
+                        if not voice_attach_result["success"]:
+                            st.error(f"Couldn't process the voice reply: {voice_attach_result['error']}")
+                        else:
+                            new_draft = voice_attach_result["draft"]
+                            if maybe_auto_approve(new_draft["message_id"], lead["id"], new_draft["mode"], new_draft.get("needs_escalation", False)):
+                                st.success(f"Voice reply processed — score now {voice_attach_result['score']}/100 — auto-approved and sent per autonomy settings (recording attached).")
+                            else:
+                                st.success(f"Voice reply processed — score now {voice_attach_result['score']}/100 — new draft ready above (the recording will be attached when you approve/send it).")
+                            st.rerun()
 
         stuck_leads = [
             l for l in list_leads()

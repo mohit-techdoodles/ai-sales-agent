@@ -219,6 +219,8 @@ def init_db():
                 external_id TEXT,
                 needs_escalation INTEGER DEFAULT 0,
                 escalation_reason TEXT,
+                attachment_filename TEXT,
+                attachment_data TEXT,
                 created_at TEXT,
                 decided_at TEXT,
                 FOREIGN KEY (lead_id) REFERENCES leads (id)

@@ -14,6 +14,8 @@ succeeds. If sending fails, the lead is marked 'send_failed' so nothing
 is silently lost or misreported.
 """
 
+import base64
+
 from database import get_conn, log_activity, now_iso
 from draft import get_message, get_pending_messages_for_lead
 from leads import get_lead
@@ -23,9 +25,13 @@ from emailer import send_email
 def _dispatch_send(message: dict) -> dict:
     lead = get_lead(message["lead_id"])
 
+    attachment_filename = message.get("attachment_filename")
+    attachment_bytes = base64.b64decode(message["attachment_data"]) if message.get("attachment_data") else None
+
     if message["channel"] == "email":
         to_email = lead.get("email", "") if lead else ""
-        return send_email(to_email, message.get("subject", ""), message["body"])
+        return send_email(to_email, message.get("subject", ""), message["body"],
+                           attachment_filename=attachment_filename, attachment_bytes=attachment_bytes)
 
     if message["channel"] == "telegram":
         from telegram_bot import send_telegram_message

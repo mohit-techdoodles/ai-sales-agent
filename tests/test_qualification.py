@@ -116,5 +116,9 @@ def test_submit_followup_answer_reruns_qualification_and_advances():
 
     assert result["status"] == "qualified"
     updated = get_lead(lead["id"])
-    assert "Follow-up answer:" in updated["message"]
+    # V4/V5 improvement: the actual question is included alongside the answer
+    # (a bare answer like "$500" is meaningless to the extraction model on
+    # its own without knowing which question it was answering).
+    assert "We asked:" in updated["message"]
+    assert "They answered:" in updated["message"]
     assert updated["pending_question"] is None
