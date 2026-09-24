@@ -17,11 +17,14 @@ Design notes:
 
 import json
 import os
+import time
 from groq import Groq
 from dotenv import load_dotenv
 
 from database import get_conn, log_activity, now_iso
 from leads import get_lead
+from pii_guard import sanitize_input, detect_prompt_injection
+from security_log import log_security_event
 
 load_dotenv()
 
@@ -75,14 +78,25 @@ If a field isn't mentioned, use an empty string "" — do not guess or invent de
 """
 
 
-def _call_llm(lead_message: str, extra_context: str = "") -> str:
-    """Raw call to Groq. Returns the model's text response."""
+def _call_llm(lead_message: str, extra_context: str = "", lead_id: int | None = None,
+              step: str = "qualify_extract") -> str:
+    """Raw call to Groq. Returns the model's text response.
+
+    V6-A: sanitizes PII out of the lead-provided text before it leaves our
+    system, screens for prompt-injection phrasing, and records both (plus
+    latency) to security_audit — regardless of what the call itself returns.
+    """
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-    user_prompt = f"Lead's message / notes:\n{lead_message}\n"
-    if extra_context:
-        user_prompt += f"\nAdditional context:\n{extra_context}\n"
+    injection = detect_prompt_injection(lead_message)
+    sanitized_message = sanitize_input(lead_message)
+    sanitized_extra = sanitize_input(extra_context) if extra_context else {"text": "", "entities_found": []}
 
+    user_prompt = f"Lead's message / notes:\n{sanitized_message['text']}\n"
+    if sanitized_extra["text"]:
+        user_prompt += f"\nAdditional context:\n{sanitized_extra['text']}\n"
+
+    start = time.perf_counter()
     response = client.chat.completions.create(
         model=MODEL,
         messages=[
@@ -93,6 +107,11 @@ def _call_llm(lead_message: str, extra_context: str = "") -> str:
         max_tokens=1200,
         reasoning_effort="low",  # gpt-oss-120b "thinks" before answering; low keeps that brief
     )
+    latency_ms = int((time.perf_counter() - start) * 1000)
+
+    all_entities = sorted(set(sanitized_message["entities_found"]) | set(sanitized_extra["entities_found"]))
+    log_security_event(lead_id, step, MODEL, all_entities, injection["flagged"], latency_ms)
+
     return response.choices[0].message.content.strip()
 
 
@@ -117,14 +136,14 @@ def _parse_json_response(raw_text: str, required_fields: list[str] = None) -> di
     return data
 
 
-def extract_requirements(lead_message: str, extra_context: str = "") -> dict:
+def extract_requirements(lead_message: str, extra_context: str = "", lead_id: int | None = None) -> dict:
     """
     Calls the LLM to extract structured fields from a lead's message.
     Retries once with a stricter reminder if the first response isn't valid JSON.
     Returns a dict with use_case, budget, authority, timeline, notes.
     Raises RuntimeError if both attempts fail to produce valid JSON.
     """
-    raw = _call_llm(lead_message, extra_context)
+    raw = _call_llm(lead_message, extra_context, lead_id=lead_id)
     parsed = _parse_json_response(raw)
 
     if parsed is None:
@@ -132,7 +151,7 @@ def extract_requirements(lead_message: str, extra_context: str = "") -> dict:
             lead_message
             + "\n\nIMPORTANT: Respond with ONLY the raw JSON object. No explanation, no markdown."
         )
-        raw = _call_llm(retry_message, extra_context)
+        raw = _call_llm(retry_message, extra_context, lead_id=lead_id, step="qualify_extract_retry")
         parsed = _parse_json_response(raw)
 
     if parsed is None:
@@ -146,23 +165,36 @@ def get_missing_fields(requirements: dict) -> list[str]:
     return [f for f in FOLLOWUP_PRIORITY if not (requirements.get(f) or "").strip()]
 
 
-def _call_llm_with_prompt(system_prompt: str, user_content: str) -> str:
-    """Like _call_llm but with a caller-supplied system prompt (used for non-extraction calls, e.g. dynamic question selection)."""
+def _call_llm_with_prompt(system_prompt: str, user_content: str, lead_id: int | None = None,
+                           step: str = "qualify_followup_question") -> str:
+    """Like _call_llm but with a caller-supplied system prompt (used for non-extraction calls, e.g. dynamic question selection).
+
+    V6-A: same PII sanitization + injection screening + audit logging as _call_llm.
+    """
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+    injection = detect_prompt_injection(user_content)
+    sanitized = sanitize_input(user_content)
+
+    start = time.perf_counter()
     response = client.chat.completions.create(
         model=MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": sanitized["text"]},
         ],
         temperature=0.3,
         max_tokens=600,
         reasoning_effort="low",
     )
+    latency_ms = int((time.perf_counter() - start) * 1000)
+
+    log_security_event(lead_id, step, MODEL, sanitized["entities_found"], injection["flagged"], latency_ms)
+
     return response.choices[0].message.content.strip()
 
 
-def choose_followup_question(requirements: dict, missing: list[str]) -> dict:
+def choose_followup_question(requirements: dict, missing: list[str], lead_id: int | None = None) -> dict:
     """
     V3 — dynamic qualification: asks the LLM to pick the single most
     valuable missing field and phrase a natural, contextual question for
@@ -180,7 +212,7 @@ def choose_followup_question(requirements: dict, missing: list[str]) -> dict:
     context = f"Known so far: {known}\nMissing fields: {missing}"
 
     try:
-        raw = _call_llm_with_prompt(DYNAMIC_QUESTION_SYSTEM_PROMPT, context)
+        raw = _call_llm_with_prompt(DYNAMIC_QUESTION_SYSTEM_PROMPT, context, lead_id=lead_id)
         parsed = _parse_json_response(raw, required_fields=["targeting_field", "question"])
         if parsed and parsed.get("targeting_field") in missing and parsed.get("question"):
             return {"question": parsed["question"], "targeting_field": parsed["targeting_field"]}
@@ -229,7 +261,7 @@ def qualify_lead(lead_id: int) -> dict:
     if lead is None:
         raise ValueError(f"Lead {lead_id} not found.")
 
-    requirements = extract_requirements(lead.get("message", "") or "")
+    requirements = extract_requirements(lead.get("message", "") or "", lead_id=lead_id)
     timestamp = now_iso()
     _save_requirements(lead_id, requirements, timestamp)
 
@@ -237,7 +269,7 @@ def qualify_lead(lead_id: int) -> dict:
     followup_rounds = lead.get("followup_rounds", 0) or 0
 
     if missing and followup_rounds < MAX_FOLLOWUP_ROUNDS:
-        chosen = choose_followup_question(requirements, missing)
+        chosen = choose_followup_question(requirements, missing, lead_id=lead_id)
         question = chosen["question"]
         with get_conn() as conn:
             conn.execute(
@@ -327,13 +359,20 @@ def reextract_from_reply(lead_id: int) -> dict:
         lines.append(f"{speaker}: {msg['body']}")
     combined_message = "\n\n".join(lines)
 
-    requirements = extract_requirements(combined_message)
+    requirements = extract_requirements(combined_message, lead_id=lead_id)
     timestamp = now_iso()
     _save_requirements(lead_id, requirements, timestamp)
 
     log_activity(lead_id, "reextracted_from_reply", f"Updated requirements from full thread: {requirements}")
 
     return requirements
+
+
+def save_requirements_update(lead_id: int, requirements: dict) -> None:
+    """Public wrapper around _save_requirements — used by callers outside
+    this module (e.g. call_reconciliation.py) that have already merged in
+    new information and just need it persisted as a new history row."""
+    _save_requirements(lead_id, requirements, now_iso())
 
 
 def get_requirements(lead_id: int) -> dict | None:

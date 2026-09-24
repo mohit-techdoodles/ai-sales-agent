@@ -9,10 +9,12 @@ data already in our system — never invents facts, only summarizes what's
 actually on file (same grounding discipline as draft.py).
 """
 
+import json
 import os
 from groq import Groq
 from dotenv import load_dotenv
 
+from database import get_conn, now_iso
 from leads import get_lead
 from qualify import get_requirements
 from research import get_research
@@ -132,4 +134,33 @@ def generate_briefing(lead_id: int) -> str:
         reasoning_effort="low",
     )
 
-    return response.choices[0].message.content.strip()
+    briefing_text = response.choices[0].message.content.strip()
+
+    # V6-B: persist so a later call transcript can be reconciled against
+    # what we actually believed going into the call, not re-derived after
+    # the fact. Snapshotting requirements/score here too, since those can
+    # keep changing after the briefing was read.
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO briefings (lead_id, briefing_text, requirements_snapshot, score_snapshot, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (lead_id, briefing_text, json.dumps(requirements), lead.get("score"), now_iso()),
+        )
+
+    return briefing_text
+
+
+def get_latest_briefing(lead_id: int) -> dict | None:
+    """Most recently generated briefing for a lead, or None if none exists yet."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM briefings WHERE lead_id = ? ORDER BY created_at DESC LIMIT 1", (lead_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    briefing = dict(row)
+    try:
+        briefing["requirements_snapshot"] = json.loads(briefing["requirements_snapshot"] or "{}")
+    except json.JSONDecodeError:
+        briefing["requirements_snapshot"] = {}
+    return briefing

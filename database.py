@@ -283,6 +283,58 @@ def init_db():
             )
         """)
 
+        # V6-B — persists what generate_briefing() produced, so a later call
+        # transcript can be reconciled against what we actually believed
+        # going into the call (not just re-derived after the fact).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS briefings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER NOT NULL,
+                briefing_text TEXT,
+                requirements_snapshot TEXT,
+                score_snapshot INTEGER,
+                created_at TEXT,
+                FOREIGN KEY (lead_id) REFERENCES leads (id)
+            )
+        """)
+
+        # V6-B — manual-entry version for now (see call_reconciliation.py):
+        # staff paste in a transcript rather than it arriving via a Recall.ai/
+        # Gong webhook, since Streamlit Community Cloud can't host a
+        # persistent webhook receiver. Same columns as the original blueprint.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS call_transcripts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER NOT NULL,
+                meeting_id INTEGER,
+                duration_sec INTEGER,
+                transcript_text TEXT,
+                summary_json TEXT,
+                created_at TEXT,
+                FOREIGN KEY (lead_id) REFERENCES leads (id),
+                FOREIGN KEY (meeting_id) REFERENCES meetings (id)
+            )
+        """)
+
+        # V6-A — compliance/safety trail for every LLM call. Note: the
+        # blueprint's original schema used "agent_run_id" referencing an
+        # agent_runs table, but this codebase never built that table (see
+        # README/blueprint deviations) — leads and pipeline steps ARE
+        # tracked here (lead_id, step), so we key off those instead.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS security_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER,
+                step TEXT,
+                model_name TEXT,
+                pii_entities TEXT,
+                injection_flagged INTEGER DEFAULT 0,
+                latency_ms INTEGER,
+                created_at TEXT,
+                FOREIGN KEY (lead_id) REFERENCES leads (id)
+            )
+        """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS company_enrichment (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

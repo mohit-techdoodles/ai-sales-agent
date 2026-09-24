@@ -16,12 +16,15 @@ at send time in approval.py, as defense in depth.
 """
 
 import os
+import time
 from groq import Groq
 from dotenv import load_dotenv
 
 from database import get_conn, log_activity, now_iso
 from leads import get_lead
 from qualify import get_requirements
+from pii_guard import sanitize_input, detect_prompt_injection
+from security_log import log_security_event
 
 load_dotenv()
 
@@ -171,7 +174,8 @@ def _build_meeting_confirmation_context(lead: dict, thread: list[dict], meeting_
     return "\n".join(lines)
 
 
-def _call_llm(system_prompt: str, context: str, model: str = None) -> str:
+def _call_llm(system_prompt: str, context: str, model: str = None,
+              lead_id: int | None = None, step: str = "draft") -> str:
     # V4-B: hierarchical routing — callers pass model=MODEL_LIGHT for simple
     # templated messages (initial/nudge/meeting confirmation) or leave the
     # default (MODEL_REASONING) for objection handling, which needs more
@@ -194,17 +198,29 @@ def _call_llm(system_prompt: str, context: str, model: str = None) -> str:
     if knowledge:
         system_prompt = system_prompt + f"\n\nAPPROVED KNOWLEDGE (facts you may confidently state):\n{knowledge}"
 
+    # V6-A: context is built from the lead's own words (their message +
+    # conversation thread) — sanitize PII out of it and screen for
+    # prompt-injection phrasing before it leaves our system, and log both
+    # (plus latency) to security_audit regardless of the call's outcome.
+    injection = detect_prompt_injection(context)
+    sanitized = sanitize_input(context)
+
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    start = time.perf_counter()
     response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": context},
+            {"role": "user", "content": sanitized["text"]},
         ],
         temperature=0.4,  # a little creative latitude for natural-sounding copy
         max_tokens=1200,
         reasoning_effort="low",  # gpt-oss-120b "thinks" before answering; low keeps that brief
     )
+    latency_ms = int((time.perf_counter() - start) * 1000)
+
+    log_security_event(lead_id, step, model, sanitized["entities_found"], injection["flagged"], latency_ms)
+
     return response.choices[0].message.content.strip()
 
 
@@ -305,12 +321,13 @@ def generate_draft(lead_id: int, channel: str = None) -> dict:
         context = _build_initial_context(lead, requirements)
 
     if not cache_hit:
-        raw = _call_llm(system_prompt, context, model=model)
+        raw = _call_llm(system_prompt, context, model=model, lead_id=lead_id, step=f"draft_{mode}")
         parsed = _parse_json_response(raw)
 
         if parsed is None:
             # Retry once with a stricter nudge, same pattern as qualify.py
-            raw = _call_llm(system_prompt, context + "\n\nIMPORTANT: Respond with ONLY the raw JSON object.", model=model)
+            raw = _call_llm(system_prompt, context + "\n\nIMPORTANT: Respond with ONLY the raw JSON object.",
+                             model=model, lead_id=lead_id, step=f"draft_{mode}_retry")
             parsed = _parse_json_response(raw)
 
         if parsed is None:
@@ -363,11 +380,13 @@ def generate_meeting_confirmation_draft(lead_id: int, meeting_time_display: str,
     thread = get_conversation(lead_id)
     context = _build_meeting_confirmation_context(lead, thread, meeting_time_display, meet_link)
 
-    raw = _call_llm(MEETING_CONFIRMATION_SYSTEM_PROMPT, context, model=MODEL_LIGHT)
+    raw = _call_llm(MEETING_CONFIRMATION_SYSTEM_PROMPT, context, model=MODEL_LIGHT,
+                     lead_id=lead_id, step="draft_meeting_confirmation")
     parsed = _parse_json_response(raw)
 
     if parsed is None:
-        raw = _call_llm(MEETING_CONFIRMATION_SYSTEM_PROMPT, context + "\n\nIMPORTANT: Respond with ONLY the raw JSON object.", model=MODEL_LIGHT)
+        raw = _call_llm(MEETING_CONFIRMATION_SYSTEM_PROMPT, context + "\n\nIMPORTANT: Respond with ONLY the raw JSON object.",
+                         model=MODEL_LIGHT, lead_id=lead_id, step="draft_meeting_confirmation_retry")
         parsed = _parse_json_response(raw)
 
     if parsed is None:

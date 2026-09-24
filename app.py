@@ -35,6 +35,7 @@ from voice import transcribe_audio
 from calendar_booking import get_available_slots, book_meeting, get_meetings_for_lead, list_all_meetings
 from telegram_bot import get_telegram_link, check_for_telegram_updates
 from briefing import generate_briefing
+from call_reconciliation import add_and_reconcile_transcript, get_transcripts_for_lead
 from policy import should_auto_approve, get_policy, set_policy, ACTION_TYPES
 from next_best_action import get_all_next_actions
 from settings import get_setting, set_setting
@@ -557,6 +558,50 @@ with tab_conversations:
                     briefing_key = f"briefing_text_{lead['id']}"
                     if briefing_key in st.session_state:
                         st.text_area("Briefing", value=st.session_state[briefing_key], height=300, key=f"briefing_display_{lead['id']}")
+
+                    st.divider()
+                    st.markdown("**📞 Post-call reconciliation**")
+                    st.caption(
+                        "Paste a call transcript to compare it against the pre-call briefing above "
+                        "(generate one first if you haven't) and refresh the score with anything new."
+                    )
+                    transcript_text = st.text_area(
+                        "Call transcript", height=150, key=f"transcript_input_{lead['id']}",
+                        placeholder="Paste the call transcript here...",
+                    )
+                    if st.button("Analyze & reconcile", key=f"reconcile_{lead['id']}", disabled=not transcript_text.strip()):
+                        with st.spinner("Comparing against the briefing and rescoring..."):
+                            try:
+                                reconcile_result = add_and_reconcile_transcript(lead["id"], transcript_text)
+                                st.session_state[f"reconcile_result_{lead['id']}"] = reconcile_result
+                            except Exception as e:
+                                st.error(f"Couldn't reconcile transcript: {e}")
+
+                    reconcile_key = f"reconcile_result_{lead['id']}"
+                    if reconcile_key in st.session_state:
+                        r = st.session_state[reconcile_key]
+                        before, after = r["score_before"], r["score_after"]
+                        if before is not None and after != before:
+                            st.metric("Score", f"{after}/100", delta=after - before)
+                        else:
+                            st.metric("Score", f"{after}/100")
+                        if r["discrepancies"]:
+                            st.warning("**Discrepancies found:**\n" + "\n".join(f"- {d}" for d in r["discrepancies"]))
+                        else:
+                            st.success("No discrepancies — the call matched the briefing.")
+                        if r["requirements_update"]:
+                            st.caption(f"Updated: {', '.join(r['requirements_update'].keys())}")
+
+                    past_transcripts = get_transcripts_for_lead(lead["id"])
+                    if past_transcripts:
+                        with st.expander(f"Past call reconciliations ({len(past_transcripts)})"):
+                            for t in past_transcripts:
+                                summary = t["summary_json"]
+                                st.markdown(f"**{t['created_at']}** — score {summary.get('score_before')} → {summary.get('score_after')}")
+                                if summary.get("discrepancies"):
+                                    for d in summary["discrepancies"]:
+                                        st.markdown(f"- {d}")
+                                st.divider()
 
                     st.divider()
                     st.markdown("**📅 Meetings**")

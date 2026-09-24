@@ -20,6 +20,7 @@ from database import get_conn, log_activity, now_iso
 from draft import get_message, get_pending_messages_for_lead
 from leads import get_lead
 from emailer import send_email
+from telegram_bot import send_telegram_message
 
 
 def _dispatch_send(message: dict) -> dict:
@@ -34,9 +35,9 @@ def _dispatch_send(message: dict) -> dict:
                            attachment_filename=attachment_filename, attachment_bytes=attachment_bytes)
 
     if message["channel"] == "telegram":
-        from telegram_bot import send_telegram_message
         chat_id = lead.get("telegram_chat_id", "") if lead else ""
-        return send_telegram_message(chat_id, message["body"])
+        return send_telegram_message(chat_id, message["body"],
+                                      attachment_filename=attachment_filename, attachment_bytes=attachment_bytes)
 
     print(f"\n--- SEND (channel '{message['channel']}' not yet implemented — printing instead) ---")
     print(f"Body:\n{message['body']}")

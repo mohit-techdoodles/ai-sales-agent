@@ -45,8 +45,16 @@ def get_telegram_link(lead_id: int) -> str:
     return f"https://t.me/{BOT_USERNAME}?start={lead_id}"
 
 
-def send_telegram_message(chat_id: str, text: str) -> dict:
-    """Sends a message via the Telegram Bot API. Returns {"sent": bool, "error": str|None}."""
+def send_telegram_message(chat_id: str, text: str,
+                           attachment_filename: str = None, attachment_bytes: bytes = None) -> dict:
+    """Sends a message via the Telegram Bot API, then the attachment (if any)
+    as a separate follow-up message. Returns {"sent": bool, "error": str|None}.
+
+    Two calls instead of one because Telegram's document/voice endpoints use
+    a "caption" field capped at 1024 characters, which is too short for our
+    longer drafts — sending the text via sendMessage first keeps the full
+    body intact, with the file arriving right after as its own bubble.
+    """
     if not BOT_TOKEN:
         return {"sent": False, "error": "TELEGRAM_BOT_TOKEN not set in .env"}
     if not chat_id:
@@ -57,6 +65,39 @@ def send_telegram_message(chat_id: str, text: str) -> dict:
             f"{API_BASE}/sendMessage",
             json={"chat_id": chat_id, "text": text},
             timeout=15,
+        )
+        data = response.json()
+        if not data.get("ok"):
+            return {"sent": False, "error": data.get("description", "Unknown Telegram API error")}
+
+        if attachment_filename and attachment_bytes:
+            attach_result = _send_telegram_attachment(chat_id, attachment_filename, attachment_bytes)
+            if not attach_result["sent"]:
+                # The text message already went through — don't report this as
+                # a full failure, but do surface that the attachment specifically didn't land.
+                return {"sent": True, "error": f"Message sent, but attachment failed: {attach_result['error']}"}
+
+        return {"sent": True, "error": None}
+    except Exception as e:
+        return {"sent": False, "error": str(e)}
+
+
+def _send_telegram_attachment(chat_id: str, filename: str, file_bytes: bytes) -> dict:
+    """
+    Sends a file via Telegram's sendDocument endpoint. Deliberately NOT using
+    sendVoice for our .wav voice notes even though that gives a nicer native
+    playback bubble — sendVoice specifically requires OGG/OPUS-encoded audio,
+    and st.audio_input in the New Lead form / Approval Inbox records WAV.
+    Sending WAV through sendVoice risks Telegram rejecting it or mishandling
+    it; sendDocument accepts any file type and is the one guaranteed to work
+    without needing an audio transcode step we don't have.
+    """
+    try:
+        response = requests.post(
+            f"{API_BASE}/sendDocument",
+            data={"chat_id": chat_id},
+            files={"document": (filename, file_bytes)},
+            timeout=30,
         )
         data = response.json()
         if data.get("ok"):
