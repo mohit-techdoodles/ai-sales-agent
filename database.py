@@ -316,6 +316,24 @@ def init_db():
             )
         """)
 
+        # Lightweight reframing of the blueprint's intent_events: instead of
+        # website-tracking pixels (external infrastructure we don't have),
+        # signals are derived from conversation data we already store (see
+        # intent.py) — reply latency, latency trend, engagement depth, and
+        # high-intent question keywords. Same audit-trail spirit, populated
+        # from messages.created_at/body instead of a JS tracking snippet.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS intent_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER NOT NULL,
+                event_type TEXT,
+                weight INTEGER,
+                detail TEXT,
+                captured_at TEXT,
+                FOREIGN KEY (lead_id) REFERENCES leads (id)
+            )
+        """)
+
         # V6-A — compliance/safety trail for every LLM call. Note: the
         # blueprint's original schema used "agent_run_id" referencing an
         # agent_runs table, but this codebase never built that table (see

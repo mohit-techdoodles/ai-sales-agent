@@ -36,6 +36,7 @@ from calendar_booking import get_available_slots, book_meeting, get_meetings_for
 from telegram_bot import get_telegram_link, check_for_telegram_updates
 from briefing import generate_briefing
 from call_reconciliation import add_and_reconcile_transcript, get_transcripts_for_lead
+from intent import compute_intent_signals, intent_label
 from policy import should_auto_approve, get_policy, set_policy, ACTION_TYPES
 from next_best_action import get_all_next_actions
 from settings import get_setting, set_setting
@@ -761,7 +762,9 @@ with tab_next_actions:
             with st.container():
                 col1, col2 = st.columns([3, 1])
                 with col1:
-                    st.write(f"{icon} **{lead['name']}** ({lead['company'] or 'no company'})")
+                    intent_badge = intent_label(compute_intent_signals(lead["id"]))
+                    badge_suffix = f"  {intent_badge}" if intent_badge != "—" else ""
+                    st.write(f"{icon} **{lead['name']}** ({lead['company'] or 'no company'}){badge_suffix}")
                     st.caption(lead["next_action_reason"])
                 with col2:
                     if action == "run_pipeline":
@@ -1045,6 +1048,7 @@ with tab_dashboard:
                     "Company": l["company"],
                     "Status": l["status"],
                     "Score": l["score"],
+                    "Intent": intent_label(compute_intent_signals(l["id"])),
                     "Source": l["source"],
                     "Created": l["created_at"][:19] if l["created_at"] else "",
                 }

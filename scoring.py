@@ -16,6 +16,7 @@ score comes with a plain-English explanation a salesperson can trust.
 
 from database import get_conn, log_activity, now_iso
 from qualify import get_requirements
+from intent import record_intent_signals
 
 MAX_POINTS_PER_FACTOR = 25
 
@@ -136,8 +137,16 @@ def rescore_lead(lead_id: int) -> dict:
     """
     V2 Step 3 — recalculates the score after a reply (using whatever
     requirements are freshest, e.g. after reextract_from_reply()), and adds
-    a flat engagement bonus for having replied at all — responsiveness is
+    an engagement bonus for having replied at all — responsiveness is
     itself a real qualifying signal a one-shot initial score can't capture.
+
+    On top of that flat baseline, intent.record_intent_signals() adds
+    weighted bonus points for HOW the lead engaged — fast/accelerating
+    replies, sustained back-and-forth, and high-intent questions (pricing,
+    integration, timeline) all count for more than a single generic reply.
+    This is the lightweight, zero-infrastructure stand-in for the
+    blueprint's website-tracking intent_events — same purpose (surface
+    rising/falling interest), derived from conversation data we already have.
 
     Unlike score_lead(), this does NOT touch lead.status (keeps 'replied'/
     'opted_out' intact — those are managed by the reply-handling flow).
@@ -148,8 +157,15 @@ def rescore_lead(lead_id: int) -> dict:
         raise ValueError(f"Lead {lead_id} has no extracted requirements yet.")
 
     base_score, reasons = calculate_score(requirements)
-    final_score = min(100, base_score + ENGAGEMENT_BONUS)
-    reasons = reasons + [f"+{ENGAGEMENT_BONUS} replied to outreach (engagement signal)"]
+    intent_signals = record_intent_signals(lead_id)
+
+    total_bonus = ENGAGEMENT_BONUS + intent_signals["bonus_points"]
+    final_score = min(100, base_score + total_bonus)
+    reasons = (
+        reasons
+        + [f"+{ENGAGEMENT_BONUS} replied to outreach (engagement signal)"]
+        + intent_signals["signal_reasons"]
+    )
     reasons_text = "; ".join(reasons)
     timestamp = now_iso()
 
